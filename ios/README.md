@@ -38,8 +38,9 @@ generated and gitignored.
    Downloads continue in the background.
 4. **Record** → Start, talk, lock the screen if you like (background audio keeps
    capture running), Stop.
-5. **Notes** → unlock the notebook, enter an activation code (the core needs
-   `RECORDLESS_TRIAL_URL` set when `build-xcframework.sh` ran), pick a model, choose
+5. **Notes** → unlock the notebook, enter an activation code (redeemed with the
+   credit service compiled in by `build-xcframework.sh`; it defaults to the same
+   Worker as desktop, override with `RECORDLESS_TRIAL_URL`), pick a model, choose
    what to scrub, Write notes. Shows each verification check, elapsed time and token
    counts, then the notes. Save to vault (creates the notebook on first use). There is no passphrase: the
    notebook unlocks with Face ID, or the device passcode as fallback. A device

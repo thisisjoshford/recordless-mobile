@@ -5,10 +5,12 @@
 # Usage: scripts/build-xcframework.sh [--debug]
 # Env:   IPHONEOS_DEPLOYMENT_TARGET (default 17.0)
 #        RECORDLESS_TRIAL_URL  https:// base URL of the credit service
-#                              (services/trial-keys); compiled into the core.
-#                              Without it, activation codes are unavailable
-#                              (an own `sk-` key still works).
+#                              (services/trial-keys in the desktop repo);
+#                              compiled into the core. Defaults to the current
+#                              Worker, as desktop's clean_build.sh does.
 set -euo pipefail
+
+export RECORDLESS_TRIAL_URL=${RECORDLESS_TRIAL_URL:-https://recordless-trial-keys.thisisjoshford.workers.dev}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
