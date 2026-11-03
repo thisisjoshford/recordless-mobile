@@ -1,0 +1,6 @@
+# whisper-rs-sys forwards CMAKE_* environment variables to whisper.cpp's CMake
+# build. This makes every whisper.cpp/ggml C, C++ and ObjC source force-include
+# core/native/wipe_free.h, so their free()/realloc() calls zero the block first.
+# If you change it, `cargo clean -p whisper-rs-sys` (cargo does not track it).
+[env]
+CMAKE_PROJECT_INCLUDE = { value = "core/native/whisper_wipe.cmake", relative = true }

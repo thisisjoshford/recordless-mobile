@@ -1,0 +1,31 @@
+{
+  "name": "Confidential Meeting Notes",
+  "description": "Notes for any confidential meeting, capturing discussion, decisions, and next steps without identifying participants.",
+  "sections": [
+    {
+      "title": "Meeting Summary",
+      "instruction": "Briefly summarize the purpose, main topics, and outcomes of the meeting. Refer to people by non-identifying roles or as participants; do not include personal names or identifying details.",
+      "format": "paragraph"
+    },
+    {
+      "title": "Discussion Highlights",
+      "instruction": "Summarize the main ideas, perspectives, concerns, and information shared. Preserve important differences of opinion without identifying who said what.",
+      "format": "list"
+    },
+    {
+      "title": "Decisions and Agreements",
+      "instruction": "List decisions and agreements explicitly reached. Distinguish confirmed outcomes from proposals; do not invent agreement.",
+      "format": "list"
+    },
+    {
+      "title": "Open Questions",
+      "instruction": "List unresolved questions, concerns, and topics that need further discussion.",
+      "format": "list"
+    },
+    {
+      "title": "Next Steps",
+      "instruction": "List agreed actions, any non-identifying responsible roles, and timing only when explicitly discussed. If responsibility is unclear, say it is unspecified. Do not invent owners, deadlines, or transcript references.",
+      "format": "list"
+    }
+  ]
+}

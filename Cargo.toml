@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "uniffi-bindgen"]
+default-members = ["core"]
+
+[workspace.dependencies]
+uniffi = "0.32"
+
+[profile.release]
+lto = false
+codegen-units = 16
+debug = false
+strip = false
+panic = "unwind"

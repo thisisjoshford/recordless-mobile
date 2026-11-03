@@ -1,0 +1,211 @@
+import AVFoundation
+
+/// Microphone capture: AVAudioEngine input tap -> 16 kHz mono Float32 -> sink.
+///
+/// Audio exists only in memory. Nothing here (or anywhere in the app) writes
+/// samples to disk: no AVAudioFile, no AVAudioRecorder.
+final class AudioCapture: @unchecked Sendable {
+    enum State: Equatable {
+        case stopped
+        case running
+        case interrupted
+        case failed(String)
+    }
+
+    typealias Sink = @Sendable ([Float]) -> Void
+
+    /// Called on an arbitrary thread with a level in 0...1, quantized to 0.05 steps.
+    var onLevel: (@Sendable (Float) -> Void)?
+    /// Called on an arbitrary thread when capture state changes.
+    var onState: (@Sendable (State) -> Void)?
+
+    private let engine = AVAudioEngine()
+    private let pushQueue = DispatchQueue(label: "org.recordless.audio.push", qos: .userInitiated)
+    private let lock = NSLock()
+    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                             sampleRate: 16_000,
+                                             channels: 1,
+                                             interleaved: false)!
+    private var converter: AVAudioConverter?
+    private var sink: Sink?
+    private var wantsRunning = false
+    private var lastLevel: Float = -1
+    private var observers: [NSObjectProtocol] = []
+
+    deinit {
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    // MARK: Public
+
+    func start(sink: @escaping Sink) throws {
+        let session = AVAudioSession.sharedInstance()
+        // .record keeps other audio from mixing in; measurement mode disables
+        // AGC / voice processing so the ASR sees the raw signal.
+        try session.setCategory(.record, mode: .measurement, options: [])
+        try? session.setPreferredSampleRate(48_000)
+        try? session.setPreferredIOBufferDuration(0.02)
+        try session.setActive(true)
+
+        lock.withLock {
+            self.sink = sink
+            self.wantsRunning = true
+        }
+        registerObservers()
+        try startEngine()
+    }
+
+    func stop() {
+        lock.withLock {
+            wantsRunning = false
+            sink = nil
+        }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        converter = nil
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        // Drain anything still queued for the core before we return.
+        pushQueue.sync {}
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        emitLevel(0)
+        onState?(.stopped)
+    }
+
+    // MARK: Engine
+
+    private func startEngine() throws {
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        let inFormat = input.outputFormat(forBus: 0)
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+            throw NSError(domain: "AudioCapture", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "No microphone input available"])
+        }
+        guard let conv = AVAudioConverter(from: inFormat, to: targetFormat) else {
+            throw NSError(domain: "AudioCapture", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot convert \(inFormat) to 16 kHz mono"])
+        }
+        conv.downmix = true
+        conv.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+        converter = conv
+
+        let bufferSize = AVAudioFrameCount(inFormat.sampleRate * 0.1) // ~100 ms
+        input.installTap(onBus: 0, bufferSize: bufferSize, format: inFormat) { [weak self] buffer, _ in
+            self?.handle(buffer)
+        }
+        engine.prepare()
+        try engine.start()
+        onState?(.running)
+    }
+
+    private func restartIfWanted() {
+        guard lock.withLock({ wantsRunning }) else { return }
+        do {
+            engine.stop()
+            try AVAudioSession.sharedInstance().setActive(true)
+            try startEngine()
+        } catch {
+            onState?(.failed(error.localizedDescription))
+        }
+    }
+
+    private func handle(_ buffer: AVAudioPCMBuffer) {
+        guard let converter, buffer.frameLength > 0 else { return }
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+
+        var supplied = false
+        var convError: NSError?
+        let status = converter.convert(to: out, error: &convError) { _, inputStatus in
+            if supplied {
+                inputStatus.pointee = .noDataNow   // streaming: keep converter state
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return buffer
+        }
+        guard status != .error, out.frameLength > 0, let ch = out.floatChannelData?[0] else { return }
+
+        let samples = Array(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
+        emitLevel(Self.level(of: samples))
+
+        guard let sink = lock.withLock({ self.sink }) else { return }
+        pushQueue.async { sink(samples) }
+    }
+
+    private func emitLevel(_ level: Float) {
+        guard level != lastLevel else { return }
+        lastLevel = level
+        onLevel?(level)
+    }
+
+    /// RMS -> dBFS -> 0...1 over a -60...0 dB window, quantized to 0.05.
+    static func level(of samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for s in samples { sum += s * s }
+        let rms = (sum / Float(samples.count)).squareRoot()
+        let db = 20 * log10(max(rms, 1e-7))
+        let norm = min(max((db + 60) / 60, 0), 1)
+        return (norm / 0.05).rounded() * 0.05
+    }
+
+    // MARK: Notifications
+
+    private func registerObservers() {
+        guard observers.isEmpty else { return }
+        let nc = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+
+        observers.append(nc.addObserver(forName: AVAudioSession.interruptionNotification,
+                                        object: session, queue: nil) { [weak self] note in
+            self?.handleInterruption(note)
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification,
+                                        object: session, queue: nil) { [weak self] note in
+            self?.handleRouteChange(note)
+        })
+        observers.append(nc.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                        object: engine, queue: nil) { [weak self] _ in
+            // Input format may have changed (e.g. headset plugged in): rebuild tap + converter.
+            self?.restartIfWanted()
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                                        object: session, queue: nil) { [weak self] _ in
+            guard let self, self.lock.withLock({ self.wantsRunning }) else { return }
+            try? session.setCategory(.record, mode: .measurement, options: [])
+            self.restartIfWanted()
+        })
+    }
+
+    private func handleInterruption(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            // Phone call / Siri took the mic. The engine is already paused by the system.
+            emitLevel(0)
+            onState?(.interrupted)
+        case .ended:
+            // Resume regardless of .shouldResume: the user explicitly started a meeting
+            // and has not stopped it. If the system refuses, surface the failure.
+            restartIfWanted()
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleRouteChange(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+        switch reason {
+        case .newDeviceAvailable, .oldDeviceUnavailable, .override, .routeConfigurationChange:
+            if !engine.isRunning { restartIfWanted() }
+        default:
+            break
+        }
+    }
+}
