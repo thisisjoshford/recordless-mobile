@@ -48,9 +48,9 @@ build_target aarch64-apple-ios-sim iphonesimulator
 DEVICE_LIB="$ROOT/target/aarch64-apple-ios/$PROFILE/$LIB"
 SIM_LIB="$ROOT/target/aarch64-apple-ios-sim/$PROFILE/$LIB"
 
-# Exactly one ggml must be in the archive: whisper-rs-sys's own (stock crate,
-# Metal on). Nothing else may bring a second copy (e.g. a reintroduced
-# llama.cpp), so a core ggml symbol must be defined exactly once.
+# Exactly one ggml must be in the archive: llama-cpp-sys-2's (CPU + Metal),
+# which the patched whisper-rs-sys (vendor/) compiles whisper.cpp against.
+# core/build.rs checks the per-crate archives; this checks the final one.
 for lib in "$DEVICE_LIB" "$SIM_LIB"; do
   n=$(nm -g "$lib" 2>/dev/null | grep -c ' T _ggml_init$' || true)
   if [[ "$n" != "1" ]]; then
@@ -59,21 +59,31 @@ for lib in "$DEVICE_LIB" "$SIM_LIB"; do
   fi
 done
 
-# Native heap wiping (core/native/): whisper.cpp/ggml must be compiled with
-# wipe_free.h force-included (no direct free/realloc), and the replacement
-# operator new/delete must be in the archive. A stale whisper-rs-sys build
-# (cargo does not track .cargo/config.toml [env]) fails here; fix with
-# `cargo clean -p whisper-rs-sys --target <triple> --release`.
+# Native heap wiping (core/native/): whisper.cpp, llama.cpp and ggml must be
+# compiled with wipe_free.h force-included (no direct free/realloc), and the
+# replacement operator new/delete must be in the archive. A stale
+# llama-cpp-sys-2 build (cargo does not track .cargo/config.toml's
+# CMAKE_PROJECT_INCLUDE) fails here or in core/build.rs; fix with
+# `cargo clean -p llama-cpp-sys-2 --target <triple> --release`.
+# core/build.rs checks every object of the llama-cpp-sys-2 and whisper-rs-sys
+# archives at build time; here the final archive is checked by object name:
+# ggml*, llama* and llama.cpp's unity_N objects, and cc's <hash>-whisper.o.
 for lib in "$DEVICE_LIB" "$SIM_LIB"; do
-  syms=$(nm -A -u "$lib" 2>/dev/null | grep -E '(ggml|whisper)[^:]*\.o: ' | awk '{print $NF}' || true)
-  if grep -qxE '_(free|realloc)' <<<"$syms"; then
-    echo "error: whisper.cpp/ggml in $lib call free/realloc directly (wipe_free.h not applied)" >&2
-    exit 1
-  fi
-  if ! grep -qx '_recordless_wiping_free' <<<"$syms"; then
-    echo "error: whisper.cpp/ggml in $lib do not call recordless_wiping_free" >&2
-    exit 1
-  fi
+  for pat in 'ggml[^:]*' 'llama[^:]*' 'unity_[0-9]+_cxx\.cxx' '[0-9a-f]+-whisper'; do
+    syms=$(nm -A -u "$lib" 2>/dev/null | grep -v "\.rcgu\.o" | grep -E "[:(\[]${pat}\.o[])]?: " | awk '{print $NF}' || true)
+    if [[ -z "$syms" ]]; then
+      echo "error: no ${pat} objects in $lib" >&2
+      exit 1
+    fi
+    if grep -qxE '_(free|realloc)' <<<"$syms"; then
+      echo "error: ${pat} objects in $lib call free/realloc directly (wipe_free.h not applied)" >&2
+      exit 1
+    fi
+    if [[ "$pat" != unity* ]] && ! grep -qx '_recordless_wiping_free' <<<"$syms"; then
+      echo "error: ${pat} objects in $lib do not call recordless_wiping_free" >&2
+      exit 1
+    fi
+  done
   defs=$(nm -A -g "$lib" 2>/dev/null | grep -E 'wipe\.o: ' || true)
   for op in __ZdlPv __ZdaPv __ZdlPvm __ZdlPvSt11align_val_t __Znwm __ZnwmSt11align_val_t; do
     if ! grep -q " T ${op}\$" <<<"$defs"; then

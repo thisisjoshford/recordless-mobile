@@ -1,12 +1,16 @@
 import SwiftUI
 
-/// Notes from the private cloud. The scrubbed transcript goes only to a NEAR AI
-/// model in a TEE whose attestation passed on the same connection; this screen
-/// chooses what to scrub and which model, and shows what was verified.
+/// Notes on this device (default) or from the private cloud. On the device,
+/// llama.cpp runs in the core and nothing leaves the iPhone. In the private
+/// cloud, the scrubbed transcript goes only to a NEAR AI model in a TEE whose
+/// attestation passed on the same connection. This screen chooses where, what
+/// to scrub and which model, and shows what ran (and, for the cloud, what was
+/// verified).
 struct GenerateView: View {
     @Environment(Recorder.self) private var recorder
     @Environment(NotesGenerator.self) private var gen
     @Environment(VaultLock.self) private var vault
+    @Environment(ModelStore.self) private var store
     @State private var title = ""
     @State private var savedID: String?
     @State private var saveError: String?
@@ -14,54 +18,114 @@ struct GenerateView: View {
     @State private var activationCode = ""
     @State private var pendingScrubOff: ScrubCategory?
 
-    private var canGenerate: Bool {
-        !gen.running && recorder.phase == .stopped && recorder.session != nil
-            && vault.vault != nil && gen.credit?.active == true
+    private var localModels: [ModelSpec] { store.ready(.notes) }
+    private var localModel: ModelSpec? {
+        localModels.first { $0.id == gen.localModelID } ?? localModels.first
+    }
+
+    /// Why Write notes is disabled, or nil when it can run.
+    private var blocker: String? {
+        if gen.running { return nil }
+        switch recorder.phase {
+        case .recording, .loadingModel, .stopping:
+            return "Stop the recording on the Record tab first."
+        case .idle:
+            return "Record and stop a meeting first."
+        case .stopped:
+            break
+        }
+        guard recorder.session != nil else { return "Record and stop a meeting first." }
+        if (recorder.progress?.segments ?? 0) == 0 {
+            return "No speech was transcribed in this meeting, so there is nothing to write notes from. Check Bench for the microphone diagnostics."
+        }
+        switch gen.location {
+        case .onDevice:
+            if localModel == nil {
+                if case .downloading = store.status[ModelSpec.qwen2B.id] ?? .missing {
+                    return "The notes model is still downloading (Models tab)."
+                }
+                return "Download the notes model (Qwen 3.5 2B) in the Models tab first."
+            }
+        case .privateCloud:
+            guard vault.vault != nil else {
+                return "Unlock the notebook: your private cloud activation is stored there."
+            }
+            guard let credit = gen.credit else {
+                return gen.creditError.map { "Couldn't check private cloud credit: \($0)" } ?? "Checking private cloud credit…"
+            }
+            if !credit.active { return "Enter an activation code above to use the private cloud." }
+        }
+        return nil
     }
 
     var body: some View {
+        @Bindable var gen = gen
         List {
-            if recorder.phase != .stopped || recorder.session == nil {
-                Section {
-                    Text("Record and stop a meeting first.").foregroundStyle(.secondary)
+            Section {
+                Picker("Where", selection: $gen.location) {
+                    ForEach(NotesWhere.allCases) { Text($0.title).tag($0) }
                 }
+                .pickerStyle(.segmented)
+                .disabled(gen.running)
+            } footer: {
+                Text(gen.location == .onDevice
+                     ? "Notes are written on this iPhone. Nothing leaves the device."
+                     : "Notes are written by a NEAR AI model in a verified secure enclave. The scrubbed transcript leaves the device only after the enclave is verified.")
             }
 
-            if vault.vault == nil {
-                Section {
-                    Button {
-                        showVaultGate = true
-                    } label: {
-                        Label("Unlock notebook", systemImage: "lock.open")
+            switch gen.location {
+            case .onDevice:
+                localModelSection
+            case .privateCloud:
+                if vault.vault == nil {
+                    Section {
+                        Button {
+                            showVaultGate = true
+                        } label: {
+                            Label("Unlock notebook", systemImage: "lock.open")
+                        }
+                    } footer: {
+                        Text("Your private cloud activation is stored in the notebook, so unlock it to use the private cloud.")
                     }
-                } footer: {
-                    Text("Your private cloud activation is stored in the notebook, so unlock it to write notes.")
+                } else {
+                    creditSection
+                    modelSection
                 }
-            } else {
-                creditSection
-                modelSection
             }
 
             scrubSection
 
             Section {
                 Button {
-                    guard let s = recorder.session, let v = vault.vault else { return }
+                    guard let s = recorder.session else { return }
                     savedID = nil
-                    Task { await gen.generate(session: s, vault: v) }
+                    switch gen.location {
+                    case .onDevice:
+                        guard let spec = localModel else { return }
+                        let url = store.fileURL(spec)
+                        let gpu = gen.localUseGpu
+                        Task { await gen.generateOnDevice(session: s, model: url, useGpu: gpu) }
+                    case .privateCloud:
+                        guard let v = vault.vault else { return }
+                        Task { await gen.generate(session: s, vault: v) }
+                    }
                 } label: {
                     HStack {
-                        Label("Write notes in the private cloud", systemImage: "lock.shield")
+                        Label(gen.location == .onDevice ? "Write notes on this device" : "Write notes in the private cloud",
+                              systemImage: gen.location == .onDevice ? "iphone" : "lock.shield")
                         Spacer()
                         if gen.running { ProgressView() }
                     }
                 }
-                .disabled(!canGenerate)
+                .disabled(blocker != nil || gen.running)
+                if let blocker {
+                    Text(blocker).font(.callout).foregroundStyle(.secondary)
+                }
                 if gen.running, let s = recorder.session {
                     if let st = gen.status, let step = st.step {
                         VStack(alignment: .leading, spacing: 2) {
                             if st.requests > 1 {
-                                Text("Request \(st.request) of \(st.requests)").font(.caption).foregroundStyle(.secondary)
+                                Text("Step \(st.request) of \(st.requests)").font(.caption).foregroundStyle(.secondary)
                             }
                             Text(step).font(.callout)
                         }
@@ -69,7 +133,9 @@ struct GenerateView: View {
                     Button("Cancel", role: .cancel) { gen.cancel(session: s) }
                 }
             } footer: {
-                Text("Nothing but attestation evidence is sent until every check passes on the connection that carries the notes request. A failed or cancelled request keeps the transcript so you can retry.")
+                Text(gen.location == .onDevice
+                     ? "Keep Recordless open while notes are written; the screen stays on. A failed or cancelled run keeps the transcript so you can retry."
+                     : "Nothing but attestation evidence is sent until every check passes on the connection that carries the notes request. A failed or cancelled request keeps the transcript so you can retry.")
             }
 
             if let err = gen.error {
@@ -82,10 +148,16 @@ struct GenerateView: View {
 
             if let r = gen.result {
                 Section("Run") {
+                    StatRow(label: "Where", value: r.location == .onDevice ? "On this device" : "Private cloud")
                     StatRow(label: "Model", value: r.modelId)
                     StatRow(label: "Elapsed", value: Format.duration(ms: r.elapsedMs))
-                    StatRow(label: "Attested requests", value: "\(r.requests)")
+                    StatRow(label: r.location == .onDevice ? "Requests" : "Attested requests", value: "\(r.requests)")
                     StatRow(label: "Prompt / generated tokens", value: "\(r.promptTokens) / \(r.generatedTokens)")
+                    if let l = r.local {
+                        StatRow(label: "Model load", value: "\(l.loadMs) ms")
+                        StatRow(label: "Generation", value: String(format: "%.1f tokens/s", l.tokensPerS))
+                        StatRow(label: "Peak memory", value: Format.bytes(l.peakFootprintBytes))
+                    }
                 }
                 Section("Notes") {
                     Text(markdown(r.markdown)).textSelection(.enabled)
@@ -114,13 +186,16 @@ struct GenerateView: View {
             titleVisibility: .visible,
             presenting: pendingScrubOff
         ) { category in
-            Button("Send \(category.noun) unscrubbed", role: .destructive) {
+            Button(gen.location == .onDevice ? "Keep \(category.noun) in the notes" : "Send \(category.noun) unscrubbed",
+                   role: .destructive) {
                 set(category, scrub: false)
                 pendingScrubOff = nil
             }
             Button("Keep scrubbing", role: .cancel) { pendingScrubOff = nil }
         } message: { category in
-            Text("\(category.noun.capitalized) in this meeting will no longer be removed before the transcript is sent to the private cloud enclave (NEAR AI, verified TEE), and may appear in the notes.")
+            Text(gen.location == .onDevice
+                 ? "\(category.noun.capitalized) in this meeting will no longer be removed before the on-device model writes the notes, and may appear in them."
+                 : "\(category.noun.capitalized) in this meeting will no longer be removed before the transcript is sent to the private cloud enclave (NEAR AI, verified TEE), and may appear in the notes.")
         }
         .task(id: vault.vault.map(ObjectIdentifier.init)) {
             if let v = vault.vault { await gen.refresh(vault: v) }
@@ -134,6 +209,28 @@ struct GenerateView: View {
         .onChange(of: vault.state) { _, s in
             if s == .unlocked { showVaultGate = false }
         }
+    }
+
+    @ViewBuilder private var localModelSection: some View {
+        @Bindable var gen = gen
+        Section {
+            if localModels.isEmpty {
+                Text("No notes model downloaded. Get Qwen 3.5 2B (~1.3 GB) in the Models tab.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Model", selection: Binding(
+                    get: { localModel?.id ?? "" },
+                    set: { gen.localModelID = $0 })) {
+                    ForEach(localModels) { Text($0.title).tag($0.id) }
+                }
+            }
+            Toggle("Use GPU (Metal)", isOn: $gen.localUseGpu)
+        } header: {
+            Text("On-device model")
+        } footer: {
+            Text("Runs in the app with an 8k-token context; long meetings are summarised in parts and combined. The GPU is much faster; the CPU works too.")
+        }
+        .disabled(gen.running)
     }
 
     // MARK: Sections
@@ -239,11 +336,17 @@ struct GenerateView: View {
                     }))
             }
         } header: {
-            Text("Scrub before sending")
+            Text(gen.location == .onDevice ? "Scrub before writing" : "Scrub before sending")
         } footer: {
-            Text(gen.scrubsEverything
-                 ? "Removed on this device before the transcript leaves it. Names are kept out by the notes instructions, since they can't be matched by pattern."
-                 : "Some categories are not scrubbed: they go to the private cloud enclave as spoken.")
+            if gen.location == .onDevice {
+                Text(gen.scrubsEverything
+                     ? "Removed before the notes model sees the transcript, exactly as for the private cloud. Names are kept out by the notes instructions, since they can't be matched by pattern."
+                     : "Some categories are not scrubbed: the notes model sees them as spoken.")
+            } else {
+                Text(gen.scrubsEverything
+                     ? "Removed on this device before the transcript leaves it. Names are kept out by the notes instructions, since they can't be matched by pattern."
+                     : "Some categories are not scrubbed: they go to the private cloud enclave as spoken.")
+            }
         }
         .disabled(gen.running)
     }

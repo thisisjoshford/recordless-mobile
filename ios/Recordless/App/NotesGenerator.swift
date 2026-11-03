@@ -2,13 +2,41 @@ import Foundation
 import Observation
 import UIKit
 
-/// Private cloud notes: the core scrubs the transcript and sends it only to a
-/// NEAR AI model whose TEE attestation passed on the same TLS connection. The
-/// transcript never reaches Swift, and neither does the NEAR AI key (it lives
-/// in the vault). Swift sees the notes, counts, timings and what was verified.
+/// Where notes are written. On this device is the default (as on desktop).
+enum NotesWhere: String, CaseIterable, Identifiable {
+    case onDevice, privateCloud
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .onDevice: "On this device"
+        case .privateCloud: "Private cloud"
+        }
+    }
+}
+
+/// Notes on this device (llama.cpp in the core, the default) or from the
+/// private cloud: the core scrubs the transcript the same way for both, and
+/// sends it only to a NEAR AI model whose TEE attestation passed on the same
+/// TLS connection. The transcript never reaches Swift, and neither does the
+/// NEAR AI key (it lives in the vault). Swift sees the notes, counts, timings
+/// and what was verified.
 @Observable
 @MainActor
 final class NotesGenerator {
+    var location: NotesWhere {
+        didSet { UserDefaults.standard.set(location.rawValue, forKey: Self.locationKey) }
+    }
+    private static let locationKey = "generate.location"
+    /// On-device notes model (a ModelSpec id).
+    var localModelID: String {
+        didSet { UserDefaults.standard.set(localModelID, forKey: Self.localModelKey) }
+    }
+    private static let localModelKey = "generate.localModel"
+    var localUseGpu: Bool {
+        didSet { UserDefaults.standard.set(localUseGpu, forKey: Self.localGpuKey) }
+    }
+    private static let localGpuKey = "generate.localGpu"
+
     /// Scrub categories. Every one starts on for each new session.
     var scrubEmails = true
     var scrubPhones = true
@@ -51,7 +79,11 @@ final class NotesGenerator {
         + "The transcript is kept: tap Write notes to retry."
 
     init() {
-        selectedModelID = UserDefaults.standard.string(forKey: Self.modelKey)
+        let d = UserDefaults.standard
+        selectedModelID = d.string(forKey: Self.modelKey)
+        location = d.string(forKey: Self.locationKey).flatMap(NotesWhere.init(rawValue:)) ?? .onDevice
+        localModelID = d.string(forKey: Self.localModelKey) ?? ModelSpec.qwen2B.id
+        localUseGpu = d.object(forKey: Self.localGpuKey) as? Bool ?? true
     }
 
     var scrub: ScrubOptions {
@@ -125,19 +157,41 @@ final class NotesGenerator {
 
     // MARK: Generate
 
+    /// Private cloud notes.
     func generate(session: Session, vault: Vault) async {
+        let scrub = self.scrub
+        let modelID = effectiveModel?.id ?? selectedModelID
+        await run(session: session, taskName: "Private cloud notes") {
+            try session.generateNotes(vault: vault, modelId: modelID, scrub: scrub)
+        }
+        // A rejected key is recorded as used-up credit by the core.
+        if result == nil { await refreshCredit(vault: vault) }
+    }
+
+    /// On-device notes with the GGUF at `model`. The screen is kept awake
+    /// while it runs: iOS refuses GPU work from the background.
+    func generateOnDevice(session: Session, model: URL, useGpu: Bool) async {
+        let scrub = self.scrub
+        let path = model.path
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
+        await run(session: session, taskName: "On-device notes") {
+            try session.generateNotesOnDevice(modelPath: path, useGpu: useGpu, scrub: scrub)
+        }
+    }
+
+    private func run(session: Session, taskName: String,
+                     _ work: @escaping @Sendable () throws -> NotesResult) async {
         guard !running else { return }
         running = true
         error = nil
         result = nil
         status = nil
+        verification = nil
         defer {
             running = false
             onFinished?()
         }
-
-        let scrub = self.scrub
-        let modelID = effectiveModel?.id ?? selectedModelID
 
         // Poll the core's step labels while the request runs.
         let poller = Task { @MainActor [weak self] in
@@ -148,14 +202,12 @@ final class NotesGenerator {
             }
         }
 
-        beginBackgroundTask(cancelling: session)
+        beginBackgroundTask(named: taskName, cancelling: session)
         defer { endBackgroundTask() }
 
         let t0 = Date()
         do {
-            let r = try await offMain {
-                try session.generateNotes(vault: vault, modelId: modelID, scrub: scrub)
-            }
+            let r = try await offMain(work)
             result = r
             verification = r.verification
         } catch {
@@ -169,17 +221,15 @@ final class NotesGenerator {
         wallMs = UInt64(Date().timeIntervalSince(t0) * 1000)
         poller.cancel()
         status = nil
-        // A rejected key is recorded as used-up credit by the core.
-        if result == nil { await refreshCredit(vault: vault) }
     }
 
     /// Ask iOS for background time so switching apps does not drop the
     /// attested request. If the time runs out, cancel the request (the core
     /// keeps the transcript) and end the task before iOS suspends us.
-    private func beginBackgroundTask(cancelling session: Session) {
+    private func beginBackgroundTask(named name: String, cancelling session: Session) {
         interruptedInBackground = false
         endBackgroundTask()
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Private cloud notes") { [weak self] in
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
             // UIKit calls the expiration handler on the main thread.
             MainActor.assumeIsolated {
                 self?.interruptedInBackground = true

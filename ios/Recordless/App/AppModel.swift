@@ -10,6 +10,7 @@ final class AppModel {
     let recorder = Recorder()
     let vault = VaultLock()
     let generator = NotesGenerator()
+    var selectedTab: AppTab = .models
 
     /// The scene is in the background (set by `RecordlessApp`). While it is,
     /// a lock that unfinished work refused is retried each time work ends.

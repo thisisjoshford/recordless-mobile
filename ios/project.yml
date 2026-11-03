@@ -30,6 +30,23 @@ targets:
         includes:
           - "*.swift"
         createIntermediateGroups: true
+    postBuildScripts:
+      # DEBUG only: synthesise the self-test fixture (macOS `say`, synthetic
+      # speech, not a recording) into the app bundle. Release builds skip it,
+      # so no audio file ships. See Recordless/App/SelfTest.swift.
+      - name: Self-test fixture (Debug only)
+        basedOnDependencyAnalysis: true
+        inputFiles:
+          - $(SRCROOT)/../scripts/make-selftest-fixture.sh
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/selftest.wav
+        script: |
+          out="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/selftest.wav"
+          if [ "${CONFIGURATION}" != "Debug" ]; then
+            rm -f "$out"
+            exit 0
+          fi
+          "${SRCROOT}/../scripts/make-selftest-fixture.sh" "$out"
     dependencies:
       - framework: Frameworks/RecordlessCore.xcframework
         embed: false          # static library inside the xcframework

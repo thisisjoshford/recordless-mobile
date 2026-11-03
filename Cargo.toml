@@ -12,3 +12,8 @@ codegen-units = 16
 debug = false
 strip = false
 panic = "unwind"
+
+# One ggml: whisper.cpp is compiled against llama-cpp-sys-2's ggml instead of
+# its own copy (vendor/whisper-rs-sys/README.md).
+[patch.crates-io]
+whisper-rs-sys = { path = "vendor/whisper-rs-sys" }

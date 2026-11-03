@@ -17,9 +17,15 @@ regex = "1.11"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-# Speech. Stock whisper-rs-sys builds whisper.cpp with its own ggml; Metal is
-# compiled in and `use_gpu` picks it at runtime.
+# Speech and on-device notes share one ggml (CPU + Metal): llama-cpp-sys-2
+# builds and installs it, and the patched whisper-rs-sys (vendor/) compiles
+# whisper.cpp against it. Both sys crates are direct dependencies so build.rs
+# can check their archives. llama-cpp-sys-2 is pinned exactly: the patch is
+# built against its headers.
 whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
+whisper-rs-sys = "0.15"
+llama-cpp-2 = { version = "=0.1.160", default-features = false, features = ["metal"] }
+llama-cpp-sys-2 = { version = "=0.1.160", default-features = false, features = ["metal"] }
 # Encrypted vault (SQLCipher, statically linked with a vendored OpenSSL).
 rusqlite = { version = "0.41", features = ["bundled-sqlcipher-vendored-openssl"] }
 

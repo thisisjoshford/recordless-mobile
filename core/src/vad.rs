@@ -32,7 +32,28 @@ pub struct Output {
     pub discarded: u64,
 }
 
+/// Counters and levels for diagnostics. No audio content: frame counts and
+/// RMS levels only.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VadStats {
+    pub frames: u64,
+    pub speech_frames: u64,
+    /// Utterances closed and handed on for transcription.
+    pub utterances: u64,
+    /// Utterances dropped as too short (clicks).
+    pub dropped: u64,
+    /// RMS of the loudest frame in the most recent ~1 s of audio.
+    pub recent_peak_rms: f32,
+    pub noise_rms: f32,
+    pub threshold_rms: f32,
+    pub in_speech: bool,
+}
+
 pub struct EnergyVad {
+    stats: VadStats,
+    /// Loudest frame so far in the current ~1 s window, and frames in it.
+    window_peak: f32,
+    window_frames: usize,
     partial: Vec<f32>,
     /// Samples consumed into whole frames so far.
     position: u64,
@@ -48,6 +69,9 @@ pub struct EnergyVad {
 impl Default for EnergyVad {
     fn default() -> Self {
         Self {
+            stats: VadStats { noise_rms: ABS_FLOOR, threshold_rms: ABS_FLOOR * NOISE_RATIO, ..Default::default() },
+            window_peak: 0.0,
+            window_frames: 0,
             partial: Vec::with_capacity(FRAME),
             position: 0,
             noise: ABS_FLOOR,
@@ -65,7 +89,14 @@ fn rms(frame: &[f32]) -> f32 {
     (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
 }
 
+/// Frames per ~1 s level window (33 x 30 ms).
+const LEVEL_WINDOW_FRAMES: usize = 33;
+
 impl EnergyVad {
+    pub fn stats(&self) -> VadStats {
+        VadStats { in_speech: self.in_speech, ..self.stats }
+    }
+
     pub fn push(&mut self, mut samples: &[f32]) -> Output {
         let mut out = Output::default();
         while !samples.is_empty() {
@@ -99,10 +130,21 @@ impl EnergyVad {
         let level = rms(&frame);
         let threshold = (self.noise * NOISE_RATIO).max(ABS_FLOOR);
         let speech = level > threshold;
+        self.stats.frames += 1;
+        self.stats.speech_frames += u64::from(speech);
+        self.window_peak = self.window_peak.max(level);
+        self.window_frames += 1;
+        if self.window_frames >= LEVEL_WINDOW_FRAMES {
+            self.stats.recent_peak_rms = self.window_peak;
+            self.window_peak = 0.0;
+            self.window_frames = 0;
+        }
         if !speech {
             // Track the floor down fast, up slowly.
             self.noise = if level < self.noise { level.max(1e-5) } else { self.noise * 0.995 + level * 0.005 };
         }
+        self.stats.noise_rms = self.noise;
+        self.stats.threshold_rms = (self.noise * NOISE_RATIO).max(ABS_FLOOR);
         let frame_start = self.position;
         self.position += frame.len() as u64;
 
@@ -140,8 +182,10 @@ impl EnergyVad {
     fn close(&mut self, out: &mut Output) {
         let samples = std::mem::take(&mut self.current);
         if self.speech_frames >= MIN_SPEECH_FRAMES {
+            self.stats.utterances += 1;
             out.utterances.push(Utterance { samples, start_sample: self.current_start });
         } else {
+            self.stats.dropped += 1;
             out.discarded += samples.len() as u64;
         }
         self.in_speech = false;
@@ -186,6 +230,10 @@ mod tests {
         utterances.extend(out.utterances);
 
         assert_eq!(utterances.len(), 2);
+        let stats = vad.stats();
+        assert_eq!(stats.utterances, 2);
+        assert_eq!(stats.frames, total / FRAME as u64);
+        assert!(stats.speech_frames >= (2300 / 30) as u64 - 2, "{stats:?}");
         let first = &utterances[0];
         assert!(first.start_sample <= 16_000 && first.start_sample >= 16_000 - 4_800 - FRAME as u64);
         let kept: u64 = utterances.iter().map(|u| u.samples.len() as u64).sum();

@@ -34,6 +34,9 @@ struct RecordlessApp: App {
                     // Hide content in the app-switcher snapshot and whenever we are not frontmost.
                     if scenePhase != .active { PrivacyOverlay() }
                 }
+                #if DEBUG
+                .task { SelfTest.runIfRequested(app) }
+                #endif
         }
         .onChange(of: scenePhase) { _, phase in
             // Refused (and the notebook left open) while there is unfinished

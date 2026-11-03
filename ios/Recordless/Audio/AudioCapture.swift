@@ -1,5 +1,26 @@
 import AVFoundation
 
+/// Counters for the mic path (no audio): what the hardware delivers, what the
+/// converter makes of it, and the coarse level of the latest buffer.
+struct CaptureStats: Sendable, Equatable {
+    var inputSampleRate: Double = 0
+    var inputChannels: UInt32 = 0
+    var buffers: UInt64 = 0
+    var framesIn: UInt64 = 0
+    var framesOut: UInt64 = 0
+    /// Conversions that produced no output, and ones that failed.
+    var emptyConversions: UInt64 = 0
+    var conversionErrors: UInt64 = 0
+    /// RMS of the latest converted buffer, whole dBFS (-100 = silence).
+    var levelDb: Int = -100
+    var engineStarts: Int = 0
+
+    /// Output rate implied by the counts; should be ~16000.
+    var convertedRate: Double {
+        framesIn > 0 ? Double(framesOut) / Double(framesIn) * inputSampleRate : 0
+    }
+}
+
 /// Microphone capture: AVAudioEngine input tap -> 16 kHz mono Float32 -> sink.
 ///
 /// Audio exists only in memory. Nothing here (or anywhere in the app) writes
@@ -38,6 +59,10 @@ final class AudioCapture: @unchecked Sendable {
     private var epoch: UInt64 = 0
     private var lastLevel: Float = -1
     private var observers: [NSObjectProtocol] = []
+    private var _stats = CaptureStats()
+
+    /// Snapshot of the mic-path counters.
+    var stats: CaptureStats { lock.withLock { _stats } }
 
     deinit {
         observers.forEach(NotificationCenter.default.removeObserver)
@@ -58,6 +83,7 @@ final class AudioCapture: @unchecked Sendable {
             self.sink = sink
             self.wantsRunning = true
             self.epoch &+= 1
+            self._stats = CaptureStats()
         }
         registerObservers()
         try startEngine()
@@ -97,7 +123,12 @@ final class AudioCapture: @unchecked Sendable {
         }
         conv.downmix = true
         conv.sampleRateConverterQuality = AVAudioQuality.high.rawValue
-        lock.withLock { converter = conv }
+        lock.withLock {
+            converter = conv
+            _stats.inputSampleRate = inFormat.sampleRate
+            _stats.inputChannels = inFormat.channelCount
+            _stats.engineStarts += 1
+        }
 
         let bufferSize = AVAudioFrameCount(inFormat.sampleRate * 0.1) // ~100 ms
         input.installTap(onBus: 0, bufferSize: bufferSize, format: inFormat) { [weak self] buffer, _ in
@@ -138,10 +169,19 @@ final class AudioCapture: @unchecked Sendable {
             inputStatus.pointee = .haveData
             return buffer
         }
-        guard status != .error, out.frameLength > 0, let ch = out.floatChannelData?[0] else { return }
+        _stats.buffers += 1
+        _stats.framesIn += UInt64(buffer.frameLength)
+        if status == .error { _stats.conversionErrors += 1 }
+        guard status != .error, out.frameLength > 0, let ch = out.floatChannelData?[0] else {
+            if status != .error { _stats.emptyConversions += 1 }
+            return
+        }
+        _stats.framesOut += UInt64(out.frameLength)
 
         let samples = Array(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
-        emitLevelLocked(Self.level(of: samples))
+        let rms = Self.rms(of: samples)
+        _stats.levelDb = rms > 1e-5 ? Int((20 * log10(rms)).rounded()) : -100
+        emitLevelLocked(Self.level(rms: rms))
 
         let queuedEpoch = epoch
         pushQueue.async { [weak self] in
@@ -162,12 +202,15 @@ final class AudioCapture: @unchecked Sendable {
         onLevel?(level)
     }
 
-    /// RMS -> dBFS -> 0...1 over a -60...0 dB window, quantized to 0.05.
-    static func level(of samples: [Float]) -> Float {
+    static func rms(of samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
         var sum: Float = 0
         for s in samples { sum += s * s }
-        let rms = (sum / Float(samples.count)).squareRoot()
+        return (sum / Float(samples.count)).squareRoot()
+    }
+
+    /// RMS -> dBFS -> 0...1 over a -60...0 dB window, quantized to 0.05.
+    static func level(rms: Float) -> Float {
         let db = 20 * log10(max(rms, 1e-7))
         let norm = min(max((db + 60) / 60, 0), 1)
         return (norm / 0.05).rounded() * 0.05

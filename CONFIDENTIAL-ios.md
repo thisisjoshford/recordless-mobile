@@ -14,9 +14,11 @@ its owner (Face ID or passcode) to open. This reduces what can be recovered; it
 is **not a forensic-erasure guarantee**. Malware or a compromised OS running
 during a meeting or while the notebook is unlocked can still capture content.
 
-Unlike desktop, **notes always leave the device**: the scrubbed transcript is
-sent to a NEAR AI model in a verified secure enclave (TEE). There is no
-on-device notes model in this build. Speech-to-text stays on the device.
+As on desktop, **notes are written on the device by default**: a local model
+(Qwen 3.5 2B, llama.cpp) runs inside the app and nothing leaves the iPhone.
+The private cloud (a NEAR AI model in a verified secure enclave, TEE) is an
+option chosen per run on the Notes screen. Speech-to-text always stays on the
+device.
 
 ## How it works
 
@@ -42,7 +44,8 @@ on-device notes model in this build. Speech-to-text stays on the device.
    which also has network access (for model downloads and the attested notes
    request). Desktop's "the speech worker cannot reach the network" does not
    hold here; the guarantee is only that the core never sends audio or
-   transcript text anywhere except inside the attested request in step 5.
+   transcript text anywhere except inside the attested request in step 5,
+   and only when the private cloud was chosen.
 3. **Process in memory.** Only the **microphone** is captured (no system or
    other-app audio; iOS does not allow it). Audio is converted to 16 kHz mono
    PCM and voice-activity filtered in memory; no audio files, checkpoints or
@@ -55,19 +58,37 @@ on-device notes model in this build. Speech-to-text stays on the device.
    from `stop()`; failed inference for part of the audio keeps what succeeded
    and marks the session incomplete. Unprocessed audio is lost on exit or
    crash by design.
-5. **Generate notes (private cloud only).** The Notes screen offers the same
-   scrub categories as desktop: names and personal details (enforced by the
+5. **Generate notes (on this device by default, or private cloud).** The
+   Notes screen chooses where: **On this device** (the default) or **Private
+   cloud**. It offers the same scrub categories as desktop, applied identically
+   whichever is chosen: names and personal details (enforced by the
    prompt, which tells the model to refer to people by role), email addresses,
    phone numbers, links, and ID/card/account numbers (removed by pattern in
    the Rust core). Every category starts on for each session. Turning one off
    asks for confirmation in a native dialog that names what will no longer be
-   scrubbed and that the text goes to the private cloud enclave. (Desktop
+   scrubbed (and, for the private cloud, that the text goes to the enclave). (Desktop
    raises that dialog from the Rust core because its UI is a webview; on iOS
    the UI is native SwiftUI in the same process, so the dialog is shown by
    Swift and only the flags cross the FFI.) Scrubbing, the privacy rules and
    the prompt are built in Rust; the transcript never crosses the FFI. One notes
    request per session runs at a time.
 
+   **On this device (default).** The downloaded GGUF model (Qwen 3.5 2B Q4_K_M
+   on a 6 GB iPhone; the 4B model is offered only with 8 GB or more) is loaded
+   by llama.cpp **in the app process**, used and unloaded within the one
+   request; the Whisper model is already unloaded by then. It runs on the GPU
+   (Metal) by default or on the CPU (a toggle). Nothing is sent anywhere. The
+   context is 8k tokens; a long meeting is summarised in parts, combined and
+   written up (the same flow as the private cloud and desktop), so it takes
+   longer but never needs a larger context. iOS does not let an app use the
+   GPU in the background, so the screen is kept on while notes are written; if
+   the app is backgrounded anyway the run fails or is cancelled and the
+   transcript is kept for retry. Prompts, token lists and output are Rust heap
+   (wiped on free); llama.cpp's and ggml's C/C++ heap is wiped as for Whisper
+   (Limits). The model weights are read from the file through a read-only
+   memory map.
+
+   **Private cloud (optional).**
    **A private cloud model in a verified secure enclave.** For every request
    the core opens one TLS connection to the model's `*.completions.near.ai`
    host (normal WebPKI checks with the built-in webpki root set, via rustls)
@@ -173,19 +194,21 @@ transcript storage.
 - The encrypted notebook: note titles, timestamps, notes, and the private cloud
   key and credit record.
 - The Secure Enclave–wrapped vault key in the keychain (this device only).
-- Downloaded Whisper models (excluded from backup) and ordinary preferences,
-  including the chosen private cloud model id and the size, modification date
-  and hash of each model file already verified.
+- Downloaded Whisper and notes models (excluded from backup) and ordinary
+  preferences, including where notes are written, the chosen local and
+  private cloud model ids, and the size, modification date and hash of each
+  model file already verified.
 - Any notes you copy or share outside the app.
 
 ## Network
 
-- Whisper model downloads (Hugging Face), started by the user. URLs are pinned
-  to one `ggerganov/whisper.cpp` commit, and a file is used only if its size
+- Model downloads (Hugging Face), started by the user. Whisper URLs are pinned
+  to one `ggerganov/whisper.cpp` commit and notes model URLs to one
+  `unsloth/Qwen3.5-*-GGUF` commit, and a file is used only if its size
   and SHA-256 match the values compiled into the app (checked before it is
   moved into place, and again for any file on disk not already verified);
   a file that does not match is deleted.
-- Private cloud notes: the NEAR AI TEE host for the model (attestation, the
+- Private cloud notes, only when chosen: the NEAR AI TEE host for the model (attestation, the
   notes request, its signature), `completions.near.ai` and `cloud-api.near.ai`
   for the host list and model catalogue, Intel PCS, NVIDIA NRAS and
   `raw.githubusercontent.com` for attestation evidence.
@@ -196,9 +219,11 @@ transcript storage.
 
 ## Limits and prerequisites
 
-- **Notes always leave the device** (scrubbed as chosen) to the attested NEAR AI
-  enclave. There is no local notes option yet. Don't use the app for sessions
-  that must not leave the device.
+- With **Private cloud** chosen, notes leave the device (scrubbed as chosen)
+  to the attested NEAR AI enclave. For sessions that must not leave the
+  device, keep the default, **On this device**.
+- On-device notes from a 2B model are less thorough than a large cloud
+  model's; review them.
 - The TEE checks prove genuine hardware, an encrypted channel into it, and
   which deployment NEAR is running. The platform status is often `OutOfDate`
   (known Intel advisories not yet patched), NEAR shares one TLS key across its
@@ -206,13 +231,16 @@ transcript storage.
 - **No worker isolation.** Speech, scrubbing and the attested request all run
   in the app process, which has network access. A memory-safety bug in
   whisper.cpp/ggml, SQLCipher or the TLS/attestation stack is a bug in a
-  process that can reach the network. Desktop's Seatbelt-sandboxed workers have
-  no iOS equivalent; the iOS app sandbox is the only boundary.
+  process that can reach the network. The same holds for llama.cpp, which
+  parses the downloaded (hash-pinned) model file in process. Desktop's
+  Seatbelt-sandboxed workers have no iOS equivalent; the iOS app sandbox is
+  the only boundary.
 - Only the explicitly locked transcript buffers are guaranteed by `mlock` not
   to be paged out. iOS may compress or swap app memory. See
   [libsodium's memory-management notes](https://doc.libsodium.org/memory_management).
 - **What is wiped before it is freed.** Rust heap (the core's global
-  allocator). whisper.cpp and ggml's C/C++ heap, two ways (`core/native/`):
+  allocator). whisper.cpp, llama.cpp and ggml's C/C++ heap (one ggml, shared by
+  speech and notes), two ways (`core/native/`):
   - The core replaces the global C++ `operator new`/`delete` (all 20 sized,
     aligned, array and nothrow forms); `delete` zeroes the whole malloc block
     (`malloc_size`, `memset_s`) before `free`. whisper.cpp's `std::string` /
@@ -223,17 +251,20 @@ transcript storage.
     the replacement is process-wide, so C++ `delete` in system libraries
     (libc++ itself, as a host test shows) also zeroes; this is harmless but
     costs time on every delete.
-  - whisper.cpp and ggml are compiled with a header that redirects their
-    `free`/`realloc` to wiping versions (the build fails if any of their
+  - whisper.cpp, llama.cpp and ggml are compiled with a header that redirects
+    their `free`/`realloc` to wiping versions (the build fails if any of their
     objects still calls `free`/`realloc` directly). On iOS ggml allocates its
     CPU buffers (weights, KV cache, compute buffers holding audio features and
     activations) and its Metal shared buffers (the unified-memory host
     allocation the GPU uses) with `posix_memalign` and releases them with
     `free`, so these are zeroed by the CPU when the whisper state is freed (at
-    `stop()`/`discard()`). This is done at the allocator rather than with
+    `stop()`/`discard()`) and when the notes model's contexts (KV cache,
+    compute buffers) are freed at the end of each on-device run. This is done at the allocator rather than with
     `ggml_backend_buffer_clear`, because whisper.cpp's state is opaque to the
     core and frees its buffers internally.
-- **What is not wiped.** Memory freed with plain `free` outside whisper.cpp/ggml:
+- **What is not wiped.** Memory freed with plain `free` outside whisper.cpp,
+  llama.cpp and ggml (and one llama-cpp-sys-2 helper that frees grammar and
+  chat-template strings the core never requests):
   system frameworks (Metal, Accelerate/BLAS scratch, AVFoundation capture
   buffers, Foundation, the Swift runtime), SQLCipher, OpenSSL and ring (they
   wipe their own key material, not every buffer); Metal **private** (GPU-only)

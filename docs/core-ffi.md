@@ -20,10 +20,13 @@ Both sides build against it; change it here first.
   `confidential/store.rs`); `mlock` is attempted, failure is reported, not ignored.
 - Scrubbing (port of desktop `confidential/redact.rs`) happens in Rust before
   any prompt is built. `ScrubOptions` default is everything on.
-- Notes come only from the private cloud: a NEAR AI model in a TEE, used only
-  after attestation passes on the same TLS connection that carries the prompt,
-  and only from NEAR AI's TEE host list (port of desktop `summary/nearai/`). The
-  response must be signed by the attested key. There is no local notes model.
+- Notes are written **on the device by default** (llama.cpp in process,
+  `core/src/local_notes.rs`; the GGUF is loaded, used and unloaded inside one
+  call, after the speech model is unloaded). Optionally they come from the
+  private cloud: a NEAR AI model in a TEE, used only after attestation passes
+  on the same TLS connection that carries the prompt, and only from NEAR AI's
+  TEE host list (port of desktop `summary/nearai/`). The response must be
+  signed by the attested key. Scrubbing and privacy rules are identical for both.
 - The NEAR AI key is stored in the vault and never returned to Swift. See
   `CONFIDENTIAL-ios.md`.
 
@@ -41,17 +44,40 @@ record SessionProgress {
   speech_ms: u64,          // speech audio covered by those segments
   pending_ms: u64,         // audio buffered but not yet transcribed
   incomplete: bool,        // some inference failed; partial transcript kept
+  in_speech: bool,         // VAD is inside an utterance (transcribed after a pause / 28 s)
+  transcribing: bool,      // whisper is running on an utterance now
+}
+
+record SessionDiagnostics {  // counts and whole-dBFS levels only; no audio, no text
+  chunks_received: u64, samples_received: u64,          // push_audio calls / 16 kHz samples
+  vad_frames: u64, vad_speech_frames: u64,              // 30 ms frames
+  utterances: u64, utterances_dropped: u64,             // closed for whisper / too short
+  level_dbfs: i32, noise_floor_dbfs: i32, threshold_dbfs: i32,  // loudest frame in last ~1 s
+  inference_runs: u64, inference_failures: u64, empty_results: u64, last_inference_ms: u64,
+  gpu_fallback: bool,      // a GPU run failed; speech moved to the CPU for the session
 }
 
 record SpeechStats { load_ms: u64, realtime_factor: f64 }   // audio secs / compute secs
 
+enum NotesLocation { OnDevice, PrivateCloud }
+
+record LocalNotesStats {
+  load_ms: u64, prompt_ms: u64, generate_ms: u64,
+  prompt_tokens_per_s: f64, tokens_per_s: f64,           // prefill / generation
+  context_tokens: u32,     // 8192
+  peak_footprint_bytes: u64,                             // ledger peak when the run ended
+  gpu: bool,
+}
+
 record NotesResult {
   markdown: String,        // generated notes (allowed to cross; transcript is not)
-  model_id: String,
-  verification: VerificationReport,
-  prompt_tokens: u32,      // summed over every attested request
+  model_id: String,        // cloud model id, or the GGUF file name
+  location: NotesLocation,
+  verification: Option<VerificationReport>,   // private cloud only
+  local: Option<LocalNotesStats>,             // on device only
+  prompt_tokens: u32,      // summed over every request
   generated_tokens: u32,
-  requests: u32,           // attested requests (chunks + combine + final for long meetings)
+  requests: u32,           // chunks + combine(s) + final for long meetings, else 1
   elapsed_ms: u64,
 }
 
@@ -80,7 +106,8 @@ record CreditStatus {
 enum CoreError { ModelLoad(msg), Inference(msg), MemoryLock(msg), Vault(msg), InvalidState(msg),
                  Attestation(msg),   // TEE verification failed; nothing but attestation evidence sent
                  PrivateCloud(msg),  // network / key / credit / response-signature / model output
-                 Cancelled(msg) }    // cancel_notes(); transcript kept
+                 Cancelled(msg),     // cancel_notes(); transcript kept
+                 LocalNotes(msg) }   // on-device inference failed; transcript kept
 
 object Session {
   constructor new(speech_model_path: String, use_gpu: bool) -> Result<Session, CoreError>
@@ -88,10 +115,14 @@ object Session {
   fn progress() -> SessionProgress
   fn stop() -> Result<SessionProgress, CoreError>              // drains, then unloads speech model
   fn speech_stats() -> SpeechStats
+  fn diagnostics() -> SessionDiagnostics
+  fn generate_notes_on_device(model_path: String, use_gpu: bool, scrub: ScrubOptions)
+      -> Result<NotesResult, CoreError>                        // valid only after stop(); scrubs, then
+                                                               // llama.cpp in process: load, run, unload
   fn generate_notes(vault: Vault, model_id: Option<String>, scrub: ScrubOptions) -> Result<NotesResult, CoreError>
                                                                // valid only after stop(); scrubs, then
                                                                // attested private cloud request(s)
-  fn cancel_notes()                                            // drops the request in flight
+  fn cancel_notes()                                            // drops the cloud request / stops local at the next token
   fn notes_status() -> NotesStatus
   fn discard()                                                 // cancels notes, wipes transcript store; always allowed
   fn unfinished_work() -> Option<UnfinishedWork>               // what lock would destroy, if anything
@@ -150,7 +181,23 @@ Surface above is implemented as written. Details the Swift side can rely on:
 - `stop()` is idempotent; `push_audio` after `stop()`/`discard()` is `InvalidState`.
   `generate_notes` before `stop()` or with no transcribed speech is `InvalidState`.
 - VAD is a simple energy VAD (30 ms frames, adaptive floor, 750 ms hangover, 28 s cap).
-  Whisper runs English-only, greedy, `use_gpu` + flash-attn toggled together.
+  Whisper runs English-only, greedy, `use_gpu` + flash-attn toggled together. If a GPU
+  run fails (iOS refuses GPU work in the background, e.g. screen locked), the session
+  reloads the model on the CPU, retries that utterance and stays on the CPU
+  (`diagnostics().gpu_fallback`).
+- **On-device notes** (`generate_notes_on_device`, `core/src/local_notes.rs`). Needs
+  `stop()` first (so the speech model is unloaded) and no other request on the session.
+  Loads the GGUF (`n_gpu_layers` all or 0), runs, and drops model and contexts before
+  returning. Context 8192 tokens, a fresh context per request; budgets are measured with
+  the model's tokenizer: final notes get up to 1536 output tokens, chunks 640, combines
+  1024. A transcript that does not fit one final request is chunked (desktop
+  `chunk_text`, re-split until each chunk fits), each chunk summarised, the summaries
+  combined in groups that fit, then written up with the `confidential_meeting` template.
+  Qwen3.5 non-thinking chat template and desktop's `qwen35_summary` sampling (temp 0.5,
+  top-k 20, top-p 0.8, presence 0.3, repeat 1.05 over 256). An empty or reasoning-only
+  answer is retried once. Errors: `ModelLoad` (GGUF), `LocalNotes` (inference),
+  `Cancelled`. `notes_status()` reports steps ("Summarising part 2 of 3", …).
+  `verification` is `None`; `local` has the timings.
 - **Private cloud notes** (`core/src/notes.rs`, `core/src/nearai/`). `generate_notes`
   needs `stop()` first, an open vault holding an activation (else
   `PrivateCloud(msg: "Enter an activation code to use the private cloud.")`), and no other
@@ -186,11 +233,13 @@ Surface above is implemented as written. Details the Swift side can rely on:
 - **Native heap wiping** (`core/native/`, `core/src/native_wipe.rs`). `build.rs`
   compiles `wipe.cpp` (replacement C++ `operator new`/`delete`, wiping
   `free`/`realloc`), linked whole-archive. `.cargo/config.toml` sets
-  `CMAKE_PROJECT_INCLUDE`, which whisper-rs-sys forwards to whisper.cpp's CMake,
-  force-including `wipe_free.h` into every whisper.cpp/ggml C/C++/ObjC source.
+  `CMAKE_PROJECT_INCLUDE`, which llama-cpp-sys-2 forwards to llama.cpp's CMake,
+  force-including `wipe_free.h` into every llama.cpp/ggml C/C++/ObjC source.
   Cargo does not track that variable: after changing it run
-  `cargo clean -p whisper-rs-sys` (per target). `build-xcframework.sh` fails if
-  whisper/ggml objects still call `free`/`realloc` or the operators are missing.
+  `cargo clean -p llama-cpp-sys-2` (per target). The patched whisper-rs-sys
+  force-includes the same header (`RECORDLESS_WIPE_FREE_H`, tracked). `core/build.rs`
+  fails if any llama.cpp/ggml/whisper archive calls `free`/`realloc` directly, and
+  `build-xcframework.sh` re-checks the final archive and the operators.
   `Session.new` fails with `MemoryLock` if the native wipe object is not linked.
 - Private cloud code runs on a 2-thread tokio runtime inside the core (`nearai::runtime`);
   each FFI call `block_on`s from the caller's thread. TLS is rustls + ring with the
@@ -200,9 +249,17 @@ Surface above is implemented as written. Details the Swift side can rely on:
 
 ### One ggml
 
-llama.cpp is gone, so whisper no longer shares ggml: stock `whisper-rs-sys` 0.15 (feature
-`metal`, via `whisper-rs`) builds whisper.cpp with its own ggml (CPU, BLAS/Accelerate,
-Metal with the embedded shader library) for both `aarch64-apple-ios` and
-`aarch64-apple-ios-sim`. There is no vendor patch and no `[patch.crates-io]`.
-`scripts/build-xcframework.sh` still fails unless the archive defines `ggml_init` exactly
-once, so a second ggml (e.g. a reintroduced llama.cpp) is caught.
+whisper-rs-sys and llama-cpp-sys-2 each vendor ggml; two copies in one static library
+clash at link time. `vendor/whisper-rs-sys` (wired in by `[patch.crates-io]`) is
+whisper-rs-sys 0.15.0 (whisper.cpp 1.8.3) with a new `build.rs`: it compiles only
+`whisper.cpp/src/whisper.cpp` (cc, C++17) against the ggml headers that
+llama-cpp-sys-2 installs (`DEP_LLAMA_GGML_CMAKE_DIR`/../../include), generates bindings
+from those headers, and links nothing but `libwhisper.a`; ggml (CPU + Metal with the
+embedded shader library) comes from llama-cpp-sys-2. `llama-cpp-sys-2` and
+`llama-cpp-2` are pinned with `=0.1.160` in both `core/Cargo.toml` and the patch (the
+patch is only known to build against that ggml, 0.26.0). `core/build.rs` fails unless
+`ggml_init` is defined exactly once across llama-cpp-sys-2's archives and not at all in
+`libwhisper.a`; `scripts/build-xcframework.sh` checks the final archive the same way.
+llama-cpp-2 enables llama-cpp-sys-2's `common` feature, so `libllama-common` and a
+small cc-built wrapper are linked too; the wrapper's one direct `free` releases strings
+from grammar/chat-template helpers the core never calls.

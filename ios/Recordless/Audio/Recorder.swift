@@ -24,6 +24,10 @@ final class Recorder {
     private(set) var speechStats: SpeechStats?
     private(set) var modelLoadMs: UInt64?
     private(set) var pushErrors = 0
+    /// Mic path and core counters (no audio, no text), refreshed ~1 Hz while
+    /// recording and once after stop. Shown on Bench; printed in DEBUG.
+    private(set) var diagnostics: SessionDiagnostics?
+    private(set) var captureStats: CaptureStats?
     var lastError: String?
 
     /// The stopped session, handed to NotesGenerator. Cleared on discard.
@@ -103,6 +107,8 @@ final class Recorder {
         self.session = session
         progress = nil
         speechStats = nil
+        diagnostics = nil
+        captureStats = nil
         pushErrors = 0
 
         do {
@@ -149,9 +155,14 @@ final class Recorder {
         case .success(let p): progress = p
         case .failure(let error): lastError = "stop(): \(describe(error))"
         }
-        let stats = try? await offMain { session.speechStats() }
+        let stats = try? await offMain { (session.speechStats(), session.diagnostics()) }
         guard gen == generation else { return }
-        speechStats = stats
+        speechStats = stats?.0
+        diagnostics = stats?.1
+        captureStats = capture.stats
+        #if DEBUG
+        if let d = diagnostics, let c = captureStats { Self.log(progress, d, c, final: true) }
+        #endif
         level = 0
         phase = .stopped
         onWorkFinished?()
@@ -178,15 +189,31 @@ final class Recorder {
     private func startPolling(_ session: Session) {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
-                let snap = try? await offMain { (session.progress(), session.speechStats()) }
+                let snap = try? await offMain { (session.progress(), session.speechStats(), session.diagnostics()) }
                 guard !Task.isCancelled else { break }
-                if let snap {
-                    self?.progress = snap.0
-                    self?.speechStats = snap.1
+                if let snap, let self {
+                    self.progress = snap.0
+                    self.speechStats = snap.1
+                    self.diagnostics = snap.2
+                    self.captureStats = self.capture.stats
+                    #if DEBUG
+                    if tick % 2 == 0, let c = self.captureStats { Self.log(snap.0, snap.2, c, final: false) }
+                    #endif
                 }
+                tick += 1
                 try? await Task.sleep(for: .seconds(1))
             }
         }
     }
+
+    #if DEBUG
+    /// Counts and levels only, never text.
+    static func log(_ p: SessionProgress?, _ d: SessionDiagnostics, _ c: CaptureStats, final: Bool) {
+        let seg = p.map { "segments=\($0.segments) speech_ms=\($0.speechMs) pending_ms=\($0.pendingMs) in_speech=\($0.inSpeech) transcribing=\($0.transcribing) incomplete=\($0.incomplete)" } ?? "segments=?"
+        print("[mic\(final ? " final" : "")] in=\(Int(c.inputSampleRate))Hz/\(c.inputChannels)ch buffers=\(c.buffers) framesIn=\(c.framesIn) framesOut=\(c.framesOut) rate=\(Int(c.convertedRate.rounded())) empty=\(c.emptyConversions) convErr=\(c.conversionErrors) mic_db=\(c.levelDb) | core chunks=\(d.chunksReceived) samples=\(d.samplesReceived) frames=\(d.vadFrames) speechFrames=\(d.vadSpeechFrames) level_db=\(d.levelDbfs) noise_db=\(d.noiseFloorDbfs) thr_db=\(d.thresholdDbfs) utt=\(d.utterances) dropped=\(d.utterancesDropped) runs=\(d.inferenceRuns) fail=\(d.inferenceFailures) empty=\(d.emptyResults) last_ms=\(d.lastInferenceMs) gpu_fallback=\(d.gpuFallback) | \(seg)")
+        fflush(stdout)
+    }
+    #endif
 }

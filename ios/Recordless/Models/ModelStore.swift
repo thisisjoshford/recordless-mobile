@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 struct ModelSpec: Identifiable, Hashable, Sendable {
-    enum Kind: Sendable { case speech }
+    enum Kind: Sendable { case speech, notes }
 
     let id: String
     let kind: Kind
@@ -15,8 +15,13 @@ struct ModelSpec: Identifiable, Hashable, Sendable {
     let bytes: UInt64
     let sha256: String
     let optional: Bool
+    /// Notes models only: physical RAM the device needs to offer this model.
+    var minimumRAM: UInt64 = 0
 
     var approxBytes: UInt64 { bytes }
+
+    /// Offered on this device (a notes model needs enough RAM).
+    var fitsDevice: Bool { ProcessInfo.processInfo.physicalMemory >= minimumRAM }
 
     /// `ggerganov/whisper.cpp` commit the URLs, sizes and hashes are pinned to.
     /// From https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/<commit>
@@ -43,9 +48,33 @@ struct ModelSpec: Identifiable, Hashable, Sendable {
         sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
         optional: false)
 
-    /// Speech models only: notes come from the attested private cloud, so no
-    /// LLM is downloaded to the device.
-    static let all: [ModelSpec] = [whisperBase, whisperSmall]
+    /// `unsloth/Qwen3.5-*-GGUF` commits the notes model URLs, sizes and hashes
+    /// are pinned to (desktop uses the same files). From
+    /// https://huggingface.co/api/models/unsloth/<repo>/tree/<commit>
+    /// (`lfs.oid`, `lfs.size`).
+    static let qwen2BCommit = "f6d5376be1edb4d416d56da11e5397a961aca8ae"
+    static let qwen4BCommit = "e87f176479d0855a907a41277aca2f8ee7a09523"
+
+    /// Default on-device notes model: fits an 8k context on a 6 GB iPhone.
+    static let qwen2B = ModelSpec(
+        id: "qwen3.5-2b", kind: .notes, title: "Qwen 3.5 2B (notes)",
+        fileName: "Qwen3.5-2B-Q4_K_M.gguf",
+        url: URL(string: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/\(qwen2BCommit)/Qwen3.5-2B-Q4_K_M.gguf")!,
+        bytes: 1_280_835_840,
+        sha256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        optional: false)
+
+    /// Higher quality, offered only on devices with at least 8 GB of RAM.
+    static let qwen4B = ModelSpec(
+        id: "qwen3.5-4b", kind: .notes, title: "Qwen 3.5 4B (notes)",
+        fileName: "Qwen3.5-4B-Q4_K_M.gguf",
+        url: URL(string: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/\(qwen4BCommit)/Qwen3.5-4B-Q4_K_M.gguf")!,
+        bytes: 2_740_937_888,
+        sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+        optional: true,
+        minimumRAM: 7_500_000_000)   // "8 GB" devices report a little under 8 GiB
+
+    static let all: [ModelSpec] = [whisperBase, whisperSmall, qwen2B, qwen4B]
 }
 
 /// SHA-256 verification of model files, plus a cache of files already verified
@@ -185,7 +214,7 @@ final class ModelStore {
     }
 
     func ready(_ kind: ModelSpec.Kind) -> [ModelSpec] {
-        ModelSpec.all.filter { $0.kind == kind && isReady($0) }
+        ModelSpec.all.filter { $0.kind == kind && $0.fitsDevice && isReady($0) }
     }
 
     /// A file is ready only once its size and SHA-256 match the pinned spec.

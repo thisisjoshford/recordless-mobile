@@ -73,12 +73,37 @@ struct RecordView: View {
             if recorder.interrupted {
                 Label("Paused by the system (call or Siri)", systemImage: "pause.circle").foregroundStyle(.orange)
             } else {
-                Label("Listening", systemImage: "ear").foregroundStyle(.red)
+                VStack(spacing: 4) {
+                    let p = recorder.progress
+                    let segments = p?.segments ?? 0
+                    if p?.transcribing == true {
+                        Label("Transcribing…", systemImage: "text.bubble").foregroundStyle(.blue)
+                    } else if p?.inSpeech == true {
+                        Label("Hearing speech…", systemImage: "waveform").foregroundStyle(.red)
+                    } else {
+                        Label("Listening", systemImage: "ear").foregroundStyle(.red)
+                    }
+                    Text(segments == 1 ? "1 segment transcribed" : "\(segments) segments transcribed")
+                        .font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                    if let hint = quietHint {
+                        Text(hint).font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
+                    }
+                }
             }
         case .stopping: Label("Finishing transcription…", systemImage: "hourglass").foregroundStyle(.secondary)
         case .stopped: Label("Meeting captured. Generate notes in the Notes tab.", systemImage: "checkmark.circle")
             .foregroundStyle(.green)
         }
+    }
+
+    /// After ~10 s of capture with no speech detected, say why.
+    private var quietHint: String? {
+        guard let d = recorder.diagnostics, let c = recorder.captureStats else { return nil }
+        if c.buffers > 20 && d.samplesReceived == 0 {
+            return "The microphone delivers audio but none reaches the transcriber (\(c.emptyConversions) empty conversions). See Bench."
+        }
+        guard d.samplesReceived > 16_000 * 10, d.vadSpeechFrames == 0 else { return nil }
+        return "No speech detected yet (input \(d.levelDbfs) dBFS, needs \(d.thresholdDbfs)). Move closer or speak up."
     }
 
     @ViewBuilder private var controls: some View {

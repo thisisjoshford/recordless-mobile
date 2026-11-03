@@ -1,7 +1,8 @@
 //! Notes from the private cloud: a NEAR AI model in a TEE, reached only through
 //! `nearai::chat_completion`, which attests the host on the same TLS
 //! connection before the prompt is sent and checks the response signature
-//! after. There is no local notes model and no other provider.
+//! after. On-device notes (`local_notes`) share this module's records, prompt
+//! flow helpers and output cleaning.
 //!
 //! The transcript arrives here already scrubbed (see `Session::generate_notes`)
 //! and never leaves the core except inside an attested request. Swift receives
@@ -24,16 +25,50 @@ use crate::redact::ScrubOptions;
 
 // ---- FFI records -----------------------------------------------------------
 
+/// Where notes were written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotesLocation {
+    /// llama.cpp in this process; nothing leaves the device.
+    OnDevice,
+    /// A NEAR AI model in an attested TEE.
+    PrivateCloud,
+}
+
+/// Measurements of one on-device generation.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct LocalNotesStats {
+    /// Loading the GGUF (mmap + Metal/CPU buffers).
+    pub load_ms: u64,
+    /// Prompt processing (prefill) and generation, summed over requests.
+    pub prompt_ms: u64,
+    pub generate_ms: u64,
+    pub prompt_tokens_per_s: f64,
+    /// Generated tokens per second of generation time.
+    pub tokens_per_s: f64,
+    /// Context window each request ran with.
+    pub context_tokens: u32,
+    /// Process peak footprint (`ledger_phys_footprint_peak`) when the run ended.
+    pub peak_footprint_bytes: u64,
+    /// The model ran on the GPU (Metal); false means CPU only.
+    pub gpu: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct NotesResult {
     /// Generated notes (allowed to cross; the transcript is not).
     pub markdown: String,
+    /// Private cloud model id, or the local model's file name.
     pub model_id: String,
-    pub verification: VerificationReport,
-    /// Summed over every attested request this generation made.
+    pub location: NotesLocation,
+    /// Private cloud only: what was attested.
+    pub verification: Option<VerificationReport>,
+    /// On-device only.
+    pub local: Option<LocalNotesStats>,
+    /// Summed over every request this generation made.
     pub prompt_tokens: u32,
     pub generated_tokens: u32,
-    /// Attested requests made (1, or chunks + combine + final for long meetings).
+    /// Requests made (1, or chunks + combine + final for long meetings);
+    /// each private cloud request is attested separately.
     pub requests: u32,
     pub elapsed_ms: u64,
 }
@@ -285,12 +320,12 @@ static THINK_MARKER_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)</?think(?:ing)?(?:\s+[^>]*)?>").unwrap());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CleanedLlmMarkdown {
-    markdown: String,
-    reasoning_stripped: bool,
+pub(crate) struct CleanedLlmMarkdown {
+    pub markdown: String,
+    pub reasoning_stripped: bool,
 }
 
-fn clean_llm_markdown_detailed(raw: &str) -> CleanedLlmMarkdown {
+pub(crate) fn clean_llm_markdown_detailed(raw: &str) -> CleanedLlmMarkdown {
     let visible = THINK_ENVELOPE_REGEX.replace_all(raw, "");
     let reasoning_stripped = visible.as_ref() != raw;
     let trimmed = visible.trim();
@@ -307,7 +342,7 @@ fn clean_llm_markdown_detailed(raw: &str) -> CleanedLlmMarkdown {
     CleanedLlmMarkdown { markdown, reasoning_stripped }
 }
 
-fn require_visible_markdown(stage: &str, cleaned: &CleanedLlmMarkdown) -> Result<(), String> {
+pub(crate) fn require_visible_markdown(stage: &str, cleaned: &CleanedLlmMarkdown) -> Result<(), String> {
     if THINK_MARKER_REGEX.is_match(&cleaned.markdown) {
         Err(format!("{stage} contained an unterminated reasoning marker"))
     } else if cleaned.markdown.is_empty() {
@@ -318,12 +353,12 @@ fn require_visible_markdown(stage: &str, cleaned: &CleanedLlmMarkdown) -> Result
 }
 
 /// Rough token count estimation using character count (desktop).
-fn rough_token_count(s: &str) -> usize {
+pub(crate) fn rough_token_count(s: &str) -> usize {
     (s.chars().count() as f64 * 0.35).ceil() as usize
 }
 
 /// Overlapping, word-boundary chunks of roughly `chunk_size_tokens` (desktop `chunk_text`).
-fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Vec<Zeroizing<String>> {
+pub(crate) fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Vec<Zeroizing<String>> {
     if text.is_empty() || chunk_size_tokens == 0 {
         return vec![];
     }
@@ -365,7 +400,7 @@ fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Ve
     chunks
 }
 
-const MAX_CHUNK_ATTEMPTS: usize = 2;
+pub(crate) const MAX_CHUNK_ATTEMPTS: usize = 2;
 
 /// A timed-out chunk isn't retried: a second try would likely wait just as long.
 fn should_retry_chunk_failure(attempt: usize, error: &str) -> bool {
@@ -609,7 +644,9 @@ pub(crate) fn into_result(markdown: String, model: String, totals: Totals, statu
     NotesResult {
         markdown,
         model_id: model,
-        verification,
+        location: NotesLocation::PrivateCloud,
+        verification: Some(verification),
+        local: None,
         prompt_tokens: totals.prompt_tokens.min(u32::MAX as u64) as u32,
         generated_tokens: totals.generated_tokens.min(u32::MAX as u64) as u32,
         requests: totals.requests,

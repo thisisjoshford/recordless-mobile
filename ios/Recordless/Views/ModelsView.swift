@@ -10,7 +10,16 @@ struct ModelsView: View {
             } header: {
                 Text("Speech")
             } footer: {
-                Text("Speech models run on this device and are excluded from iCloud backup. Downloads continue in the background. Notes are written by a private cloud model in a verified secure enclave; nothing to download.")
+                Text("Speech models run on this device and are excluded from iCloud backup. Downloads continue in the background.")
+            }
+            Section {
+                ForEach(ModelSpec.all.filter { $0.kind == .notes && $0.fitsDevice }) { ModelRow(spec: $0) }
+            } header: {
+                Text("Notes")
+            } footer: {
+                Text("Notes are written on this iPhone by default, with this model; nothing leaves the device. "
+                     + (ModelSpec.qwen4B.fitsDevice ? "" : "The 4B model needs 8 GB of RAM and isn't offered on this iPhone. ")
+                     + "The private cloud (a verified secure enclave) is an option on the Notes screen and needs no download.")
             }
         }
         .navigationTitle("Models")
