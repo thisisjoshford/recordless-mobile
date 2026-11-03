@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import LocalAuthentication
 import Observation
@@ -30,6 +31,8 @@ final class VaultLock {
     var error: String?
 
     private(set) var vault: Vault?
+    /// Called (on main) after a note is saved, so a refused lock can be retried.
+    @ObservationIgnored var onNoteSaved: (() -> Void)?
     let vaultURL: URL
     private let vaultDir: URL
 
@@ -52,20 +55,34 @@ final class VaultLock {
             error = reason
             return
         }
+        // Never touch a notebook that is already there (state can be stale).
+        refreshState()
+        guard state == .noVault else { return }
         await run {
             // Stale items can survive an uninstall; they belong to no vault now.
             VaultKeyWrap.reset()
             let path = self.vaultURL.path
-            let key = KeyBox(try await offMain { try generateVaultKey() })
+            // Built inside the detached task so the only reference to the
+            // lifted `Data` is local there and can be wiped in place; the task
+            // result carries the box, not the bytes.
+            let key = try await offMain { () throws -> KeyBox in
+                var raw = try generateVaultKey()
+                return KeyBox(wipingSource: &raw)
+            }
             defer { key.wipe() }
             do {
-                try VaultKeyWrap.store(key: key.data)
-                let v = try await offMain { try Vault.create(path: path, key: key.data) }
+                try VaultKeyWrap.store(key: key)
+                let v = try await offMain { try key.withData { try Vault.create(path: path, key: $0) } }
                 self.protectVaultFiles()
                 self.vault = v
                 self.state = .unlocked
             } catch {
                 VaultKeyWrap.reset()
+                // The file (and journal) was created by this call and holds no
+                // notes, but without its key it would read as "key lost" and
+                // block creating a notebook. Remove it so state stays .noVault.
+                self.removePartialVault()
+                self.refreshState()
                 throw error
             }
         }
@@ -81,10 +98,10 @@ final class VaultLock {
         error = nil
         defer { busy = false }
         do {
-            let key = KeyBox(try await VaultKeyWrap.unwrap(reason: "Unlock your notebook"))
+            let key = try await VaultKeyWrap.unwrap(reason: "Unlock your notebook")
             defer { key.wipe() }
             let path = vaultURL.path
-            let v = try await offMain { try Vault.open(path: path, key: key.data) }
+            let v = try await offMain { try key.withData { try Vault.open(path: path, key: $0) } }
             vault = v
             state = .unlocked
         } catch let e as LAError where [.userCancel, .appCancel, .systemCancel].contains(e.code) {
@@ -135,6 +152,7 @@ final class VaultLock {
         guard let v = vault else { throw AppError("Vault is locked") }
         let id = try await offMain { try v.saveNote(title: title, markdown: markdown) }
         protectVaultFiles()
+        onNoteSaved?()
         return id
     }
 
@@ -153,6 +171,14 @@ final class VaultLock {
     private func refreshState() {
         let exists = (try? vaultURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { $0 > 0 } ?? false
         if !exists { state = .noVault } else { state = VaultKeyWrap.hasKey ? .locked : .keyLost }
+    }
+
+    /// Delete a notebook file `create()` just made, with SQLite's side files.
+    private func removePartialVault() {
+        let fm = FileManager.default
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            try? fm.removeItem(atPath: vaultURL.path + suffix)
+        }
     }
 
     private func run(_ body: @escaping () async throws -> Void) async {
@@ -234,7 +260,7 @@ enum VaultKeyWrap {
     /// Both the SE key and the wrapped blob are present (checked without prompting).
     static var hasKey: Bool { privateKeyExists && blobExists }
 
-    static func store(key: Data) throws {
+    fileprivate static func store(key: KeyBox) throws {
         reset()
         var cfErr: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(
@@ -257,7 +283,8 @@ enum VaultKeyWrap {
         }
         guard let publicKey = SecKeyCopyPublicKey(privateKey),
               SecKeyIsAlgorithmSupported(publicKey, .encrypt, algorithm),
-              let wrapped = SecKeyCreateEncryptedData(publicKey, algorithm, key as CFData, &cfErr) as Data? else {
+              // No-copy CFData over the box's buffer (`key as CFData` would copy).
+              let wrapped = key.withCFData({ SecKeyCreateEncryptedData(publicKey, algorithm, $0, &cfErr) }) as Data? else {
             reset()
             throw cfErr.map { $0.takeRetainedValue() as Error } ?? Failure.secureEnclave("encrypt")
         }
@@ -273,7 +300,7 @@ enum VaultKeyWrap {
 
     /// Face ID (passcode fallback) prompt, then decrypt inside the Secure Enclave.
     /// The caller must wipe the returned key once it has been used.
-    static func unwrap(reason: String) async throws -> Data {
+    fileprivate static func unwrap(reason: String) async throws -> KeyBox {
         guard let wrapped = readBlob() else { throw Failure.missing }
         let context = LAContext()
         try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
@@ -281,10 +308,12 @@ enum VaultKeyWrap {
         return try await offMain {
             guard let privateKey = try copyPrivateKey(context: ctx.value) else { throw Failure.missing }
             var cfErr: Unmanaged<CFError>?
-            guard let key = SecKeyCreateDecryptedData(privateKey, algorithm, wrapped as CFData, &cfErr) as Data? else {
+            // Kept as CFData (no bridging to Data, which could copy); the box
+            // copies it out and zeroes this buffer before it is released.
+            guard let decrypted = SecKeyCreateDecryptedData(privateKey, algorithm, wrapped as CFData, &cfErr) else {
                 throw cfErr.map { $0.takeRetainedValue() as Error } ?? Failure.secureEnclave("decrypt")
             }
-            return key
+            return KeyBox(wipingSource: decrypted)
         }
     }
 
@@ -343,17 +372,63 @@ enum VaultKeyWrap {
     }
 }
 
-/// Holds the one Swift copy of the vault key so it can be wiped in place.
-/// (A `let` copy of a `Data` would share storage and make `resetBytes` copy-on-write.)
-private final class KeyBox: @unchecked Sendable {
-    private(set) var data: Data
-    init(_ data: Data) {
-        // Own, mutable storage (a bridged CFData can't be wiped in place).
-        var own = Data(count: data.count)
-        own.withUnsafeMutableBytes { dst in _ = data.copyBytes(to: dst) }
-        self.data = own
+/// Holds the one Swift copy of the vault key in its own allocation so it can
+/// be wiped in place (`memset_s`, not elided). Each constructor zeroes the
+/// buffer it copied from. Callers see the bytes only through no-copy views.
+/// Copies this file cannot reach (uniffi's lift/lower buffers, Security's
+/// internals) are listed in CONFIDENTIAL-ios.md, Limits.
+fileprivate final class KeyBox: @unchecked Sendable {
+    private let buffer: UnsafeMutableRawBufferPointer
+
+    private init(count: Int) {
+        buffer = .allocate(byteCount: max(count, 1), alignment: 16)
+        buffer.initializeMemory(as: UInt8.self, repeating: 0)
+        self.count = count
     }
-    func wipe() { data.resetBytes(in: 0..<data.count) }
+    private let count: Int
+
+    /// Takes the key from a `Data` and zeroes the source. In place as long as
+    /// `source` is the only reference to its storage (as for the value just
+    /// lifted from `generateVaultKey()`); otherwise `resetBytes` would wipe a
+    /// copy, so callers must not keep other references.
+    convenience init(wipingSource source: inout Data) {
+        self.init(count: source.count)
+        let dst = buffer
+        source.withUnsafeBytes { src in dst.copyMemory(from: src) }
+        source.resetBytes(in: 0..<source.count)
+    }
+
+    /// Takes the key from the CFData Security returned and zeroes that buffer.
+    /// It is a fresh, uniquely owned heap object, so writing through its byte
+    /// pointer is the only way to clear it (a mutable copy would be a third copy).
+    convenience init(wipingSource source: CFData) {
+        let n = CFDataGetLength(source)
+        self.init(count: n)
+        if n > 0, let src = CFDataGetBytePtr(source) {
+            buffer.baseAddress!.copyMemory(from: src, byteCount: n)
+            _ = memset_s(UnsafeMutableRawPointer(mutating: src), n, 0, n)
+        }
+    }
+
+    deinit {
+        wipe()
+        buffer.deallocate()
+    }
+
+    func wipe() { _ = memset_s(buffer.baseAddress, buffer.count, 0, buffer.count) }
+
+    /// A `Data` over the box's buffer, valid only inside `body` (no copy).
+    func withData<T>(_ body: (Data) throws -> T) rethrows -> T {
+        try body(Data(bytesNoCopy: buffer.baseAddress!, count: count, deallocator: .none))
+    }
+
+    /// A CFData over the box's buffer, valid only inside `body` (no copy).
+    func withCFData<T>(_ body: (CFData) throws -> T) rethrows -> T {
+        let cf = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault,
+                                             buffer.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                             count, kCFAllocatorNull)!
+        return try body(cf)
+    }
 }
 
 /// LAContext isn't Sendable; it is only handed to one background call here.

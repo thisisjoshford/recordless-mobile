@@ -31,6 +31,14 @@ final class Recorder {
 
     private let capture = AudioCapture()
     private var pollTask: Task<Void, Never>?
+    /// Bumped by `discard()`. `start()`/`stop()` capture it before each await
+    /// and give up if it changed, so a discard during model load or stop is
+    /// never overwritten.
+    private var generation = 0
+
+    /// Called (on main) whenever capture ends or the session goes away, so the
+    /// app can retry a lock that unfinished work blocked.
+    @ObservationIgnored var onWorkFinished: (() -> Void)?
 
     var isCapturing: Bool { phase == .recording || phase == .loadingModel || phase == .stopping }
 
@@ -60,21 +68,35 @@ final class Recorder {
 
     func start(speechModel: URL, useGpu: Bool) async {
         guard phase == .idle else { return }
+        // Claim the recorder before the first await so a second start() is refused.
+        phase = .loadingModel
+        generation += 1
+        let gen = generation
         lastError = nil
-        guard await AVAudioApplication.requestRecordPermission() else {
+        let allowed = await AVAudioApplication.requestRecordPermission()
+        guard gen == generation else { return }    // discarded meanwhile
+        guard allowed else {
             lastError = "Microphone access is off. Enable it in Settings > Recordless."
+            phase = .idle
+            onWorkFinished?()
             return
         }
 
-        phase = .loadingModel
         let path = speechModel.path
         let t0 = Date()
         let session: Session
         do {
             session = try await offMain { try Session(speechModelPath: path, useGpu: useGpu) }
         } catch {
+            guard gen == generation else { return }
             lastError = "Could not load speech model: \(describe(error))"
             phase = .idle
+            onWorkFinished?()
+            return
+        }
+        guard gen == generation else {
+            // Discarded while the model loaded: drop the new session, never start the mic.
+            Task.detached { session.discard() }
             return
         }
         modelLoadMs = UInt64(Date().timeIntervalSince(t0) * 1000)
@@ -96,9 +118,10 @@ final class Recorder {
             }
         } catch {
             lastError = "Could not start microphone: \(error.localizedDescription)"
-            session.discard()
+            Task.detached { session.discard() }
             self.session = nil
             phase = .idle
+            onWorkFinished?()
             return
         }
 
@@ -110,22 +133,33 @@ final class Recorder {
 
     func stop() async {
         guard phase == .recording, let session else { return }
+        let gen = generation
         phase = .stopping
         stoppedAt = Date()
         capture.stop()          // drains queued pushes
         pollTask?.cancel()
+        let stopped: Result<SessionProgress, Error>
         do {
-            progress = try await offMain { try session.stop() }
+            stopped = .success(try await offMain { try session.stop() })
         } catch {
-            lastError = "stop(): \(describe(error))"
+            stopped = .failure(error)
         }
-        speechStats = try? await offMain { session.speechStats() }
+        guard gen == generation else { return }    // discarded meanwhile: stay idle
+        switch stopped {
+        case .success(let p): progress = p
+        case .failure(let error): lastError = "stop(): \(describe(error))"
+        }
+        let stats = try? await offMain { session.speechStats() }
+        guard gen == generation else { return }
+        speechStats = stats
         level = 0
         phase = .stopped
+        onWorkFinished?()
     }
 
     /// Wipes the transcript store. Call when done with this meeting.
     func discard() {
+        generation += 1          // invalidates any start()/stop() suspended in an await
         pollTask?.cancel()
         if phase == .recording { capture.stop() }
         if let session {
@@ -136,7 +170,9 @@ final class Recorder {
         startedAt = nil
         stoppedAt = nil
         interrupted = false
+        level = 0
         phase = .idle
+        onWorkFinished?()
     }
 
     private func startPolling(_ session: Session) {

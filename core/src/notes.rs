@@ -330,8 +330,10 @@ fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Ve
     let chars_per_token = 1.0 / 0.35;
     let chunk_size_chars = (chunk_size_tokens as f64 * chars_per_token).ceil() as usize;
     let overlap_chars = (overlap_tokens as f64 * chars_per_token).ceil() as usize;
-    let chars: Vec<char> = text.chars().collect();
-    let total_chars = chars.len();
+    // Byte offset of every char index, plus `text.len()` at `total_chars`, so
+    // each window's bounds are O(1) lookups (linear overall, not quadratic).
+    let offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let total_chars = offsets.len() - 1;
     if total_chars <= chunk_size_chars {
         return vec![Zeroizing::new(text.to_string())];
     }
@@ -340,8 +342,8 @@ fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Ve
     while start_char < total_chars {
         let end_char = (start_char + chunk_size_chars).min(total_chars);
         let mut emitted_end_char = end_char;
-        let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
-        let mut end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
+        let start_byte = offsets[start_char];
+        let mut end_byte = offsets[end_char];
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
             let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
@@ -625,6 +627,62 @@ mod tests {
         let text = format!("Intro. {marker} trailing content ensures chunking");
         let chunks = chunk_text(&text, 10, 1);
         assert!(chunks.iter().any(|chunk| chunk.contains(marker)));
+    }
+
+    /// The previous, quadratic implementation, kept to pin the output.
+    fn chunk_text_reference(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Vec<String> {
+        if text.is_empty() || chunk_size_tokens == 0 {
+            return vec![];
+        }
+        let chars_per_token = 1.0 / 0.35;
+        let chunk_size_chars = (chunk_size_tokens as f64 * chars_per_token).ceil() as usize;
+        let overlap_chars = (overlap_tokens as f64 * chars_per_token).ceil() as usize;
+        let chars: Vec<char> = text.chars().collect();
+        let total_chars = chars.len();
+        if total_chars <= chunk_size_chars {
+            return vec![text.to_string()];
+        }
+        let mut chunks = Vec::new();
+        let mut start_char = 0;
+        while start_char < total_chars {
+            let end_char = (start_char + chunk_size_chars).min(total_chars);
+            let mut emitted_end_char = end_char;
+            let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
+            let mut end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
+            if end_char < total_chars {
+                let slice = &text[start_byte..end_byte];
+                let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
+                let word_boundary = slice.rfind(' ').map(|index| index + 1);
+                let boundary = sentence_boundary
+                    .filter(|end| slice[..*end].chars().count() > overlap_chars)
+                    .or_else(|| word_boundary.filter(|end| slice[..*end].chars().count() > overlap_chars));
+                if let Some(boundary) = boundary {
+                    end_byte = start_byte + boundary;
+                    emitted_end_char = start_char + slice[..boundary].chars().count();
+                }
+            }
+            chunks.push(text[start_byte..end_byte].to_string());
+            if emitted_end_char >= total_chars {
+                break;
+            }
+            start_char = emitted_end_char.saturating_sub(overlap_chars).max(start_char + 1);
+        }
+        chunks
+    }
+
+    #[test]
+    fn chunk_text_matches_previous_implementation() {
+        let english = "The team agreed to ship on Friday. Alice will review the patch. ".repeat(40);
+        let multibyte = "Café meeting — naïve résumé; 会议记录 東京 🎙️ notes. Ünïcödé wörds hère. ".repeat(30);
+        let no_spaces = "ééééééééééééééééééééééééééééééééééééééééééééééééééé".repeat(8);
+        let mixed = format!("{english}{multibyte}{no_spaces} tail.");
+        let inputs = ["", "é ab", "abcd", "short", english.as_str(), multibyte.as_str(), no_spaces.as_str(), mixed.as_str()];
+        for text in inputs {
+            for (size, overlap) in [(1, 0), (1, 1), (5, 1), (10, 3), (40, 10), (100, 0), (300, 100)] {
+                let new: Vec<String> = chunk_text(text, size, overlap).iter().map(|c| c.to_string()).collect();
+                assert_eq!(new, chunk_text_reference(text, size, overlap), "size {size} overlap {overlap} on {text:?}");
+            }
+        }
     }
 
     #[test]

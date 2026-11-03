@@ -57,9 +57,14 @@ pub struct Session {
     shared: Arc<Shared>,
     worker: Mutex<Option<Worker>>,
     load_ms: u64,
-    /// One notes request per session at a time.
+    /// One notes request per session at a time. Set and cleared only while
+    /// `notes_cancel` is held; read lock-free for status.
     notes_running: AtomicBool,
-    /// Cancels the request in flight; replaced for each request.
+    /// Cancels the request in flight; replaced for each request. This mutex is
+    /// also the claim lock: a request is claimed (flag set and token
+    /// installed) in one critical section, so `cancel_notes` can never fall
+    /// between them, and `release_for_lock` holds it across its check and wipe
+    /// so no request can start meanwhile, without borrowing the flag.
     notes_cancel: Mutex<Option<Arc<Notify>>>,
     notes_status: Arc<Mutex<LiveStatus>>,
     /// The app saved notes from this transcript; it is now held only so the
@@ -193,12 +198,7 @@ impl Session {
         if self.worker.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Err(CoreError::InvalidState { msg: "call stop() before generate_notes()".into() });
         }
-        if self.notes_running.swap(true, Ordering::SeqCst) {
-            return Err(CoreError::InvalidState { msg: "notes are already being generated for this session".into() });
-        }
-        let _running = ResetOnDrop(&self.notes_running);
-        let cancel = Arc::new(Notify::new());
-        *self.notes_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&cancel));
+        let (_claim, cancel) = self.claim_notes()?;
         *self.notes_status.lock().unwrap_or_else(|p| p.into_inner()) = LiveStatus::default();
 
         // A success clears a credit run-out only if this run began after it.
@@ -228,7 +228,6 @@ impl Session {
         });
         drop(transcript);
         drop(api_key);
-        self.notes_cancel.lock().unwrap_or_else(|p| p.into_inner()).take();
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let mut status = self.notes_status.lock().unwrap_or_else(|p| p.into_inner());
         status.step = None;
@@ -253,7 +252,9 @@ impl Session {
     /// Stop the notes request in flight, if any. Its connection is dropped; the
     /// transcript is kept. `generate_notes` then returns `Cancelled`.
     pub fn cancel_notes(&self) {
-        if let Some(cancel) = self.notes_cancel.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        // `notify_one` stores a permit when nothing is waiting yet, so a cancel
+        // that lands after the claim but before the request awaits still wins.
+        if let Some(cancel) = self.notes_claim().as_ref() {
             cancel.notify_one();
         }
     }
@@ -291,10 +292,14 @@ impl Session {
     /// `None`. Atomic with respect to `generate_notes`: a request cannot start
     /// between the check and the wipe.
     pub fn release_for_lock(&self) -> Option<UnfinishedWork> {
-        if self.notes_running.swap(true, Ordering::SeqCst) {
+        // Holding the claim lock (not the running flag) keeps a request from
+        // starting until the wipe is done; a concurrent `generate_notes` waits
+        // briefly and then finds no transcript, and `notes_status` never
+        // reports a phantom request.
+        let _claim = self.notes_claim();
+        if self.notes_running.load(Ordering::SeqCst) {
             return Some(UnfinishedWork::GeneratingNotes);
         }
-        let _claim = ResetOnDrop(&self.notes_running);
         if let Some(work) = self.unfinished_besides_notes() {
             return Some(work);
         }
@@ -315,15 +320,37 @@ impl Session {
     }
 }
 
-struct ResetOnDrop<'a>(&'a AtomicBool);
+/// A claimed notes request. Dropping it clears the cancel token and the
+/// running flag together, under the claim lock.
+struct NotesClaim<'a>(&'a Session);
 
-impl Drop for ResetOnDrop<'_> {
+impl Drop for NotesClaim<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        let mut slot = self.0.notes_claim();
+        slot.take();
+        self.0.notes_running.store(false, Ordering::SeqCst);
     }
 }
 
 impl Session {
+    fn notes_claim(&self) -> std::sync::MutexGuard<'_, Option<Arc<Notify>>> {
+        self.notes_cancel.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Claim the session's one notes request: set the running flag and
+    /// install a fresh cancel token in one critical section.
+    fn claim_notes(&self) -> Result<(NotesClaim<'_>, Arc<Notify>), CoreError> {
+        let mut slot = self.notes_claim();
+        if self.notes_running.load(Ordering::SeqCst) {
+            return Err(CoreError::InvalidState { msg: "notes are already being generated for this session".into() });
+        }
+        let cancel = Arc::new(Notify::new());
+        *slot = Some(Arc::clone(&cancel));
+        self.notes_running.store(true, Ordering::SeqCst);
+        drop(slot);
+        Ok((NotesClaim(self), cancel))
+    }
+
     fn unfinished_besides_notes(&self) -> Option<UnfinishedWork> {
         if self.worker.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Some(UnfinishedWork::Recording);
@@ -442,6 +469,7 @@ fn transcribe(state: &mut WhisperState, utterance: &Utterance, sequence_id: u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     /// A stopped session holding `segments` transcript segments, no model.
     fn stopped_session(segments: u64) -> Session {
@@ -486,7 +514,7 @@ mod tests {
         assert_eq!(s.unfinished_work(), None);
         assert_eq!(s.release_for_lock(), None);
         assert_eq!(s.progress().segments, 0);
-        assert!(!s.notes_running.load(Ordering::SeqCst), "lock released its claim");
+        assert!(!s.notes_running.load(Ordering::SeqCst), "lock never sets the running flag");
     }
 
     #[test]
@@ -517,6 +545,68 @@ mod tests {
         let s = stopped_session(0);
         assert_eq!(s.unfinished_work(), None);
         assert_eq!(s.release_for_lock(), None);
+    }
+
+    /// True if `cancel` has a pending notification (polled once, no runtime).
+    fn is_cancelled(cancel: &Notify) -> bool {
+        let fut = std::pin::pin!(cancel.notified());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        fut.poll(&mut cx).is_ready()
+    }
+
+    #[test]
+    fn cancel_right_after_claim_is_not_lost() {
+        let s = Arc::new(stopped_session(1));
+        for _ in 0..500 {
+            let canceller = {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    // Cancel as soon as the request is visible as running.
+                    while !s.notes_status().running {
+                        std::hint::spin_loop();
+                    }
+                    s.cancel_notes();
+                })
+            };
+            let (claim, cancel) = s.claim_notes().expect("claim");
+            canceller.join().unwrap();
+            assert!(is_cancelled(&cancel), "a cancel after the claim reaches the request");
+            drop(claim);
+            assert!(!s.notes_status().running);
+            assert!(s.notes_cancel.lock().unwrap().is_none(), "the claim clears its token");
+        }
+    }
+
+    #[test]
+    fn second_claim_is_refused_while_one_runs() {
+        let s = stopped_session(1);
+        let (claim, _cancel) = s.claim_notes().unwrap();
+        assert!(matches!(s.claim_notes(), Err(CoreError::InvalidState { .. })));
+        assert_eq!(s.release_for_lock(), Some(UnfinishedWork::GeneratingNotes));
+        drop(claim);
+        assert!(s.claim_notes().is_ok());
+    }
+
+    #[test]
+    fn lock_in_progress_does_not_look_like_a_notes_request() {
+        let s = Arc::new(stopped_session(1));
+        s.mark_notes_saved();
+        // Hold the claim lock exactly as `release_for_lock` does mid-wipe.
+        let held = s.notes_claim();
+        assert!(!s.notes_status().running, "status does not report a phantom request");
+        assert_eq!(s.notes_running.load(Ordering::SeqCst), false);
+        let claimer = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.claim_notes().map(|(claim, _)| drop(claim)).is_ok())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!claimer.is_finished(), "a request waits for the lock to finish instead of failing");
+        drop(held);
+        assert!(claimer.join().unwrap(), "the request is not refused as already running");
+        // And a real lock leaves the flag untouched afterwards.
+        assert_eq!(s.release_for_lock(), None);
+        assert!(!s.notes_status().running);
+        assert!(s.claim_notes().is_ok());
     }
 
     #[test]

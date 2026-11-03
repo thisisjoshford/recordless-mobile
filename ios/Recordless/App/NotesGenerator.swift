@@ -43,6 +43,8 @@ final class NotesGenerator {
     @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// iOS ran out of background time and the request was cancelled.
     @ObservationIgnored private var interruptedInBackground = false
+    /// Called (on main) when a request ends: success, failure or cancellation.
+    @ObservationIgnored var onFinished: (() -> Void)?
 
     static let interruptedMessage =
         "Notes were interrupted because iOS stopped the app in the background. "
@@ -129,7 +131,10 @@ final class NotesGenerator {
         error = nil
         result = nil
         status = nil
-        defer { running = false }
+        defer {
+            running = false
+            onFinished?()
+        }
 
         let scrub = self.scrub
         let modelID = effectiveModel?.id ?? selectedModelID

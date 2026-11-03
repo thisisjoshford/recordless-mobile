@@ -21,6 +21,9 @@ final class AudioCapture: @unchecked Sendable {
 
     private let engine = AVAudioEngine()
     private let pushQueue = DispatchQueue(label: "org.recordless.audio.push", qos: .userInitiated)
+    /// Guards every field below. The tap converts, meters and enqueues while
+    /// holding it, so `stop()` (which takes it to clear them) cannot interleave
+    /// with a tap callback.
     private let lock = NSLock()
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                              sampleRate: 16_000,
@@ -29,6 +32,10 @@ final class AudioCapture: @unchecked Sendable {
     private var converter: AVAudioConverter?
     private var sink: Sink?
     private var wantsRunning = false
+    /// Bumped by `start()`/`stop()`. A queued push delivers only if the epoch
+    /// it was enqueued in is still current, so nothing reaches a session
+    /// after `stop()` (or a later capture's sink).
+    private var epoch: UInt64 = 0
     private var lastLevel: Float = -1
     private var observers: [NSObjectProtocol] = []
 
@@ -50,6 +57,7 @@ final class AudioCapture: @unchecked Sendable {
         lock.withLock {
             self.sink = sink
             self.wantsRunning = true
+            self.epoch &+= 1
         }
         registerObservers()
         try startEngine()
@@ -59,13 +67,14 @@ final class AudioCapture: @unchecked Sendable {
         lock.withLock {
             wantsRunning = false
             sink = nil
+            converter = nil
+            epoch &+= 1     // invalidates pushes already queued
         }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        converter = nil
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
-        // Drain anything still queued for the core before we return.
+        // Wait out a push already running; queued ones now see a stale epoch.
         pushQueue.sync {}
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         emitLevel(0)
@@ -88,7 +97,7 @@ final class AudioCapture: @unchecked Sendable {
         }
         conv.downmix = true
         conv.sampleRateConverterQuality = AVAudioQuality.high.rawValue
-        converter = conv
+        lock.withLock { converter = conv }
 
         let bufferSize = AVAudioFrameCount(inFormat.sampleRate * 0.1) // ~100 ms
         input.installTap(onBus: 0, bufferSize: bufferSize, format: inFormat) { [weak self] buffer, _ in
@@ -111,7 +120,9 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     private func handle(_ buffer: AVAudioPCMBuffer) {
-        guard let converter, buffer.frameLength > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard wantsRunning, let converter, let sink, buffer.frameLength > 0 else { return }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
         guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
@@ -130,13 +141,22 @@ final class AudioCapture: @unchecked Sendable {
         guard status != .error, out.frameLength > 0, let ch = out.floatChannelData?[0] else { return }
 
         let samples = Array(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
-        emitLevel(Self.level(of: samples))
+        emitLevelLocked(Self.level(of: samples))
 
-        guard let sink = lock.withLock({ self.sink }) else { return }
-        pushQueue.async { sink(samples) }
+        let queuedEpoch = epoch
+        pushQueue.async { [weak self] in
+            // Re-checked on the push queue: stop() may have run since enqueue.
+            guard let self, self.lock.withLock({ self.epoch == queuedEpoch && self.wantsRunning }) else { return }
+            sink(samples)
+        }
     }
 
     private func emitLevel(_ level: Float) {
+        lock.withLock { emitLevelLocked(level) }
+    }
+
+    /// Caller holds `lock`.
+    private func emitLevelLocked(_ level: Float) {
         guard level != lastLevel else { return }
         lastLevel = level
         onLevel?(level)

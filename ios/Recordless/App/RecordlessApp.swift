@@ -38,8 +38,9 @@ struct RecordlessApp: App {
         .onChange(of: scenePhase) { _, phase in
             // Refused (and the notebook left open) while there is unfinished
             // work, so backgrounding never destroys a recording, a notes
-            // request or an unsaved transcript.
-            if phase == .background { app.lock() }
+            // request or an unsaved transcript. AppModel retries the lock
+            // whenever such work ends while the app is still in the background.
+            app.scenePhaseChanged(background: phase == .background)
         }
     }
 }

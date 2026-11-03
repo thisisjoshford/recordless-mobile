@@ -11,6 +11,35 @@ final class AppModel {
     let vault = VaultLock()
     let generator = NotesGenerator()
 
+    /// The scene is in the background (set by `RecordlessApp`). While it is,
+    /// a lock that unfinished work refused is retried each time work ends.
+    @ObservationIgnored private(set) var inBackground = false
+
+    init() {
+        // Hooks fire synchronously from inside recorder/generator/vault calls
+        // (including `lock()` itself), so the retry is deferred to a fresh turn.
+        let retry: () -> Void = { [weak self] in
+            Task { @MainActor in self?.lockIfInBackground() }
+        }
+        recorder.onWorkFinished = retry
+        generator.onFinished = retry
+        vault.onNoteSaved = retry
+    }
+
+    /// Called on every scene phase change.
+    func scenePhaseChanged(background: Bool) {
+        inBackground = background
+        lockIfInBackground()
+    }
+
+    /// Lock on entering the background, and again whenever work that refused
+    /// that lock (recording, notes request, unsaved transcript) ends while the
+    /// app is still in the background.
+    private func lockIfInBackground() {
+        guard inBackground else { return }
+        lock()      // idempotent; refused again if other work is still unfinished
+    }
+
     /// What locking would destroy right now (desktop CONFIDENTIAL.md step 7):
     /// a recording, a notes request in flight, or a transcript with no saved
     /// notes. `nil` means locking is allowed.

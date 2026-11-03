@@ -53,6 +53,8 @@ private struct ModelRow: View {
                 .buttonStyle(.bordered)
         case .downloading:
             Button("Cancel", role: .cancel) { store.cancel(spec) }.buttonStyle(.bordered)
+        case .verifying:
+            ProgressView().accessibilityLabel("Verifying")
         case .ready(let bytes):
             Menu {
                 Button("Delete", role: .destructive) { store.delete(spec) }

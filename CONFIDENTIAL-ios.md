@@ -27,7 +27,8 @@ on-device notes model in this build. Speech-to-text stays on the device.
    ID, or the device passcode as fallback); the wrapped key is kept in the
    keychain as `WhenPasscodeSetThisDeviceOnly`, so it is not backed up and does
    not leave the device. Unlocking decrypts the key inside the Secure Enclave,
-   opens the vault, and wipes the Swift copy. Removing the device passcode makes
+   opens the vault, and wipes the Swift copies it holds (see Limits for the
+   ones it cannot reach). Removing the device passcode makes
    iOS destroy the wrapping key; the notebook can then not be opened and is set
    aside, never deleted. There is no reset. The vault directory uses
    `NSFileProtectionComplete`. SQLCipher encrypts the database and journal;
@@ -147,8 +148,13 @@ on-device notes model in this build. Speech-to-text stays on the device.
    recording, notes are being written, or a held transcript has no saved notes
    yet, so going to the background never silently destroys unfinished work:
    the notebook then stays open in the background until that work is finished
-   or discarded, and a manual lock explains why it was refused (with a
-   "Discard session and lock" option). A transcript kept only for regeneration
+   or discarded. While the app stays in the background, the lock is retried
+   each time such work ends (a recording stops or is discarded, a notes
+   request finishes, fails or is cancelled, or notes are saved), so the
+   notebook closes as soon as nothing blocks it (a stopped recording still
+   holds an unsaved transcript, which keeps blocking until it is saved or
+   discarded). A manual lock explains why it was refused (with a "Discard
+   session and lock" option). A transcript kept only for regeneration
    (its notes already saved) does not block lock and is wiped by it. In this
    build saving already releases the transcript, so that case only arises if
    saving is changed to keep it. "Discard session" always works. The decision
@@ -168,12 +174,17 @@ transcript storage.
   key and credit record.
 - The Secure Enclave–wrapped vault key in the keychain (this device only).
 - Downloaded Whisper models (excluded from backup) and ordinary preferences,
-  including the chosen private cloud model id.
+  including the chosen private cloud model id and the size, modification date
+  and hash of each model file already verified.
 - Any notes you copy or share outside the app.
 
 ## Network
 
-- Whisper model downloads (Hugging Face), started by the user.
+- Whisper model downloads (Hugging Face), started by the user. URLs are pinned
+  to one `ggerganov/whisper.cpp` commit, and a file is used only if its size
+  and SHA-256 match the values compiled into the app (checked before it is
+  moved into place, and again for any file on disk not already verified);
+  a file that does not match is deleted.
 - Private cloud notes: the NEAR AI TEE host for the model (attestation, the
   notes request, its signature), `completions.near.ai` and `cloud-api.near.ai`
   for the host list and model catalogue, Intel PCS, NVIDIA NRAS and
@@ -237,6 +248,18 @@ transcript storage.
   debugger, OS diagnostics, or another participant's recording.
 - The vault key exists in app memory while the notebook is open, and the NEAR AI
   key while a request runs.
+- **Vault key copies in Swift.** The app keeps the key in one buffer of its own
+  that is zeroed (`memset_s`) after each use, and zeroes the buffer it came
+  from: the `Data` lifted from `generate_vault_key` (in place; it is the only
+  reference) and the CFData returned by Secure Enclave decryption (written
+  through its byte pointer). The key is handed to Security and to the core as
+  no-copy views of that buffer. Copies it cannot wipe: UniFFI's generated
+  lift/lower code reads the key into a temporary Swift `[UInt8]` when it comes
+  back from `generate_vault_key` and writes it into another (possibly
+  reallocated as it grows) before copying it to a Rust buffer for
+  `Vault.create`/`Vault.open`; those Swift arrays are freed without zeroing.
+  (The Rust buffers are zeroed by the core's allocator.) Copies made inside
+  Security / the Secure Enclave framework are also out of reach.
 - Pattern scrubbing cannot reliably remove names or all identifying details.
   Turning scrubbing off sends spoken names, contact details and numbers to the
   enclave and may put them in the notes. Review notes before sharing.
