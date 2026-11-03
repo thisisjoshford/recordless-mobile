@@ -1,0 +1,90 @@
+name: Recordless
+options:
+  bundleIdPrefix: org.recordless
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""            # set your team ID here (or in Xcode) for device builds
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    # The core xcframework ships arm64 simulator slices only.
+    "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
+
+targets:
+  Recordless:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Recordless
+      - path: Generated
+        optional: true
+        includes:
+          - "*.swift"
+        createIntermediateGroups: true
+    postBuildScripts:
+      # DEBUG only: synthesise the self-test fixture (macOS `say`, synthetic
+      # speech, not a recording) into the app bundle. Release builds skip it,
+      # so no audio file ships. See Recordless/App/SelfTest.swift.
+      - name: Self-test fixture (Debug only)
+        basedOnDependencyAnalysis: true
+        inputFiles:
+          - $(SRCROOT)/../scripts/make-selftest-fixture.sh
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/selftest.wav
+        script: |
+          out="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/selftest.wav"
+          if [ "${CONFIGURATION}" != "Debug" ]; then
+            rm -f "$out"
+            exit 0
+          fi
+          "${SRCROOT}/../scripts/make-selftest-fixture.sh" "$out"
+    dependencies:
+      - framework: Frameworks/RecordlessCore.xcframework
+        embed: false          # static library inside the xcframework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.recordless.ios
+        PRODUCT_NAME: Recordless
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Recordless/Support/Recordless.entitlements
+        OTHER_LDFLAGS: "$(inherited) -lc++"
+    info:
+      path: Recordless/Support/Info.plist
+      properties:
+        CFBundleDisplayName: Recordless
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSMicrophoneUsageDescription: Recordless listens to your meeting to write notes on this device. Audio stays in memory and is never saved or sent anywhere.
+        NSFaceIDUsageDescription: Use Face ID to unlock your notebook.
+        UIBackgroundModes:
+          - audio
+        ITSAppUsesNonExemptEncryption: false
+    entitlements:
+      path: Recordless/Support/Recordless.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+
+schemes:
+  Recordless:
+    build:
+      targets:
+        Recordless: all
+    run:
+      config: Debug
+    archive:
+      config: Release

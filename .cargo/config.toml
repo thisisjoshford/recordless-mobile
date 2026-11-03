@@ -1,0 +1,9 @@
+# llama-cpp-sys-2 forwards CMAKE_* environment variables to llama.cpp's CMake
+# build. This makes every llama.cpp/ggml C, C++ and ObjC source force-include
+# core/native/wipe_free.h, so their free()/realloc() calls zero the block first.
+# If you change it, `cargo clean -p llama-cpp-sys-2` (cargo does not track it).
+# The patched whisper-rs-sys (vendor/) compiles whisper.cpp with the same
+# header, named by RECORDLESS_WIPE_FREE_H (tracked).
+[env]
+CMAKE_PROJECT_INCLUDE = { value = "core/native/whisper_wipe.cmake", relative = true }
+RECORDLESS_WIPE_FREE_H = { value = "core/native/wipe_free.h", relative = true }

@@ -1,0 +1,38 @@
+# Recordless patch of whisper-rs-sys 0.15.0 (whisper.cpp 1.8.3), wired in with
+# [patch.crates-io] in the workspace Cargo.toml. See README.md here.
+#
+# Upstream builds whisper.cpp together with its own copy of ggml. llama.cpp
+# (llama-cpp-sys-2) brings another, and two ggml copies in one static library
+# clash at link time. This copy compiles only whisper.cpp/src/whisper.cpp,
+# against the ggml that llama-cpp-sys-2 builds and installs, so the app links
+# exactly one ggml (CPU + Metal).
+[package]
+name = "whisper-rs-sys"
+version = "0.15.0"
+edition = "2021"
+description = "whisper.cpp FFI bindings, built against llama-cpp-sys-2's ggml (Recordless patch)"
+license = "Unlicense"
+links = "whisper"
+publish = false
+
+[features]
+# Accepted for whisper-rs compatibility. Metal comes from llama-cpp-sys-2's
+# ggml (enabled by recordless_core's llama-cpp-2 "metal" feature).
+coreml = []
+cuda = []
+hipblas = []
+openblas = []
+metal = []
+vulkan = []
+force-debug = []
+openmp = []
+intel-sycl = []
+
+[dependencies]
+# Must be the exact version recordless_core uses: its DEP_LLAMA_GGML_CMAKE_DIR
+# locates the installed ggml headers that whisper.cpp is compiled against.
+llama-cpp-sys-2 = { version = "=0.1.160", default-features = false }
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1"

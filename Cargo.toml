@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["core", "uniffi-bindgen"]
+default-members = ["core"]
+
+[workspace.dependencies]
+uniffi = "0.32"
+
+[profile.release]
+lto = false
+codegen-units = 16
+debug = false
+strip = false
+panic = "unwind"
+
+# One ggml: whisper.cpp is compiled against llama-cpp-sys-2's ggml instead of
+# its own copy (vendor/whisper-rs-sys/README.md).
+[patch.crates-io]
+whisper-rs-sys = { path = "vendor/whisper-rs-sys" }
