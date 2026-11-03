@@ -39,8 +39,8 @@ generated and gitignored.
    continue in the background.
 4. **Record** → Start, talk, lock the screen if you like (background audio keeps
    capture running), Stop.
-5. **Notes** → Where: **On this device** (default; pick the model, GPU on) → Write
-   notes. Or **Private cloud** → unlock the notebook, enter an activation code (redeemed with the
+5. **Notes** → Where: **On this device** (default; pick the model; CPU by default,
+   GPU optional) → Write notes. Or **Private cloud** → unlock the notebook, enter an activation code (redeemed with the
    credit service compiled in by `build-xcframework.sh`; it defaults to the same
    Worker as desktop, override with `RECORDLESS_TRIAL_URL`), pick a model, choose
    what to scrub, Write notes. Shows each verification check, elapsed time and token
@@ -48,7 +48,10 @@ generated and gitignored.
    notebook unlocks with Face ID, or the device passcode as fallback. A device
    passcode is required; without one the app refuses to create a notebook.
    If Write notes is disabled, the reason is shown under it.
-6. **Bench** shows live `phys_footprint`, peak footprint, the speech realtime
+6. **Bench** → Settings has the GPU (Metal) switches for speech and on-device
+   notes. Both are **off by default**, as on desktop: memory the CPU used is wiped
+   when freed, GPU memory can't be. A GPU run that fails (iOS refuses GPU work in
+   the background) moves to the CPU. Bench also shows live `phys_footprint`, peak footprint, the speech realtime
    factor, the microphone path (input format, converted rate, levels, VAD and
    whisper counters: where audio stops if no segments appear) and the notes run
    (load ms, prefill and generation tokens/s, peak footprint).
@@ -68,8 +71,8 @@ xcrun devicectl device process launch --device <udid> --console --terminate-exis
 `-selftest` streams the fixture through `Session.push_audio` in real time and prints
 progress, diagnostics, the realtime factor and memory; `-selftest-notes` then writes
 notes on the device (downloading the model via ModelStore if needed) and prints load
-time, tokens/s and peak footprint. `-selftest-cpu`, `-selftest-notes-cpu`,
-`-selftest-speed N`, and `-mictest N` (real microphone for N seconds, mic-path
+time, tokens/s and peak footprint. Both run on the CPU (the app default);
+`-selftest-gpu` and `-selftest-notes-gpu` use Metal instead. `-selftest-speed N`, and `-mictest N` (real microphone for N seconds, mic-path
 counters every 2 s) are also available. Only counts and timings are printed. The app
 keeps running after `RESULT PASS/FAIL` (notes shown on the Notes tab) unless
 `-selftest-exit` is passed.

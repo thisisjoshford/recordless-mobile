@@ -52,6 +52,8 @@ struct Shared {
     empty_results: AtomicU64,
     last_inference_ms: AtomicU64,
     gpu_fallback: AtomicBool,
+    /// The CPU reload after a GPU failure failed; nothing more is transcribed.
+    speech_unavailable: AtomicBool,
 }
 
 impl Shared {
@@ -123,10 +125,6 @@ fn samples_to_ms(samples: u64) -> u64 {
     samples * 1000 / SAMPLE_RATE as u64
 }
 
-fn threads() -> i32 {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 4) as i32
-}
-
 #[uniffi::export]
 impl Session {
     /// Loads the whisper model synchronously (so failures surface here), then
@@ -156,7 +154,7 @@ impl Session {
         let shared = Arc::new(Shared::default());
         let (tx, rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
-        let speech = Speech { state, gpu: use_gpu, model_path: speech_model_path };
+        let speech = Speech { state: Some(state), gpu: use_gpu, model_path: speech_model_path };
         let handle = std::thread::Builder::new()
             .name("recordless-speech".into())
             .spawn(move || run_worker(speech, rx, worker_shared))
@@ -219,17 +217,26 @@ impl Session {
             empty_results: load(&self.shared.empty_results),
             last_inference_ms: load(&self.shared.last_inference_ms),
             gpu_fallback: self.shared.gpu_fallback.load(Ordering::SeqCst),
+            speech_unavailable: self.shared.speech_unavailable.load(Ordering::SeqCst),
         }
     }
 
     /// Drain queued audio, transcribe it, unload the speech model, finalize the
-    /// transcript. Idempotent. Reports a locked-memory failure as `MemoryLock`.
+    /// transcript. Idempotent. A locked-memory failure during the session is
+    /// a protected-processing failure: as on desktop, the transcript is wiped
+    /// (no notes can come from it) and `stop()` returns `MemoryLock`, every
+    /// time it is called.
     pub fn stop(&self) -> Result<SessionProgress, CoreError> {
         self.shutdown_worker();
-        self.shared.store().finalize();
-        if let Some(msg) = self.shared.lock_error.lock().unwrap_or_else(|p| p.into_inner()).clone() {
-            return Err(CoreError::MemoryLock { msg });
+        let lock_error = self.shared.lock_error.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut store = self.shared.store();
+        if let Some(msg) = lock_error {
+            store.discard();
+            store.finalize();
+            return Err(CoreError::MemoryLock { msg: format!("{msg}; the transcript was discarded") });
         }
+        store.finalize();
+        drop(store);
         Ok(self.progress())
     }
 
@@ -358,6 +365,7 @@ impl Session {
                         context_tokens: local_notes::CONTEXT_TOKENS,
                         peak_footprint_bytes: crate::memory::peak_footprint_bytes(),
                         gpu: use_gpu,
+                        gpu_fallback: totals.gpu_fallback,
                     }),
                     prompt_tokens: totals.prompt_tokens.min(u32::MAX as u64) as u32,
                     generated_tokens: totals.generated_tokens.min(u32::MAX as u64) as u32,
@@ -369,7 +377,9 @@ impl Session {
                 Err(CoreError::Cancelled { msg: "notes generation was cancelled; the transcript is kept".into() })
             }
             Err(LocalError::ModelLoad(msg)) => Err(CoreError::ModelLoad { msg }),
-            Err(LocalError::Inference(msg)) => Err(CoreError::LocalNotes { msg }),
+            Err(LocalError::Inference(msg) | LocalError::Compute(msg) | LocalError::Transient(msg)) => {
+                Err(CoreError::LocalNotes { msg })
+            }
         }
     }
 
@@ -517,22 +527,33 @@ impl Drop for Session {
     }
 }
 
-/// The loaded speech model. `gpu` is cleared (and the state reloaded on the
-/// CPU) if a GPU run fails, for example because iOS refuses GPU work while
-/// the screen is locked.
+/// The loaded speech model. If a GPU run fails (for example because iOS
+/// refuses GPU work while the screen is locked), the GPU state is dropped and
+/// the model reloaded on the CPU. `state` is `None` only if that reload
+/// failed; the rest of the session is then not transcribed.
 struct Speech {
-    state: WhisperState,
+    state: Option<WhisperState>,
     gpu: bool,
     model_path: String,
 }
 
 impl Speech {
-    fn cpu_state(&self) -> Option<WhisperState> {
+    /// Drop the GPU state first, so the two copies are never in memory
+    /// together, then load on the CPU. Called at most once per session.
+    fn fall_back_to_cpu(&mut self, shared: &Shared) {
+        self.state = None;
+        self.gpu = false;
+        shared.gpu_fallback.store(true, Ordering::SeqCst);
         let mut params = WhisperContextParameters::default();
         params.use_gpu = false;
         params.flash_attn = false;
-        let ctx = WhisperContext::new_with_params(&self.model_path, params).ok()?;
-        ctx.create_state().ok()
+        self.state = WhisperContext::new_with_params(&self.model_path, params)
+            .ok()
+            .and_then(|ctx| ctx.create_state().ok());
+        if self.state.is_none() {
+            shared.speech_unavailable.store(true, Ordering::SeqCst);
+            shared.incomplete.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -576,7 +597,7 @@ fn run_worker(mut speech: Speech, rx: Receiver<Msg>, shared: Arc<Shared>) {
 
 fn whisper_params<'a>() -> FullParams<'a, 'a> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(threads());
+    params.set_n_threads(crate::inference_threads());
     params.set_language(Some("en"));
     params.set_translate(false);
     params.set_no_context(true);
@@ -598,30 +619,31 @@ fn transcribe(speech: &mut Speech, utterance: &Utterance, sequence_id: u64, shar
         audio = std::borrow::Cow::Owned(padded);
     }
 
-    let started = Instant::now();
-    shared.inference_runs.fetch_add(1, Ordering::SeqCst);
-    let mut result = speech.state.full(whisper_params(), &audio);
-    if result.is_err() && speech.gpu {
-        // GPU work can be refused (screen locked, memory pressure): move to
-        // the CPU for the rest of the session and retry this utterance.
-        if let Some(cpu) = speech.cpu_state() {
-            speech.state = cpu;
-            speech.gpu = false;
-            shared.gpu_fallback.store(true, Ordering::SeqCst);
-            result = speech.state.full(whisper_params(), &audio);
-        }
-    }
-    let elapsed = started.elapsed();
-    shared.compute_us.fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
-    shared.last_inference_ms.store(elapsed.as_millis() as u64, Ordering::SeqCst);
-    if result.is_err() {
+    if speech.state.is_none() {
+        // The CPU reload failed earlier: count the loss, do not retry.
         shared.inference_failures.fetch_add(1, Ordering::SeqCst);
         shared.incomplete.store(true, Ordering::SeqCst);
         return;
     }
+    let started = Instant::now();
+    shared.inference_runs.fetch_add(1, Ordering::SeqCst);
+    let mut ok = speech.state.as_mut().is_some_and(|s| s.full(whisper_params(), &audio).is_ok());
+    if !ok && speech.gpu {
+        // GPU work can be refused (screen locked, memory pressure): move to
+        // the CPU for the rest of the session and retry this utterance.
+        speech.fall_back_to_cpu(shared);
+        ok = speech.state.as_mut().is_some_and(|s| s.full(whisper_params(), &audio).is_ok());
+    }
+    let elapsed = started.elapsed();
+    shared.compute_us.fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
+    shared.last_inference_ms.store(elapsed.as_millis() as u64, Ordering::SeqCst);
+    let Some(state) = speech.state.as_ref().filter(|_| ok) else {
+        shared.inference_failures.fetch_add(1, Ordering::SeqCst);
+        shared.incomplete.store(true, Ordering::SeqCst);
+        return;
+    };
     shared.transcribed_samples.fetch_add(utterance.samples.len() as u64, Ordering::SeqCst);
 
-    let state = &speech.state;
     // Pre-size so pushing does not reallocate (and leave unwiped copies).
     let mut text = String::with_capacity(8192);
     for i in 0..state.full_n_segments() {
@@ -819,6 +841,21 @@ mod tests {
         let r = s.generate_notes_on_device(llm, true, ScrubOptions::all()).unwrap_or_else(|e| panic!("{e}"));
         eprintln!("{}\nrequests {} prompt {} generated {} {:?}", r.markdown, r.requests, r.prompt_tokens, r.generated_tokens, r.local);
         assert!(r.requests >= 4, "chunked: {}", r.requests);
+    }
+
+    #[test]
+    fn stop_after_a_memory_lock_failure_discards_the_transcript() {
+        let s = stopped_session(2);
+        s.shared.lock_error.lock().unwrap().replace("mlock failed".into());
+        let err = s.stop().expect_err("stop reports the lock failure");
+        assert!(matches!(err, CoreError::MemoryLock { .. }));
+        assert_eq!(s.progress().segments, 0, "no notes can come from a protected-processing failure");
+        assert!(matches!(s.stop(), Err(CoreError::MemoryLock { .. })), "stop stays failed");
+        assert_eq!(s.unfinished_work(), None, "nothing left to block lock");
+        assert!(matches!(
+            s.generate_notes_on_device("/nonexistent.gguf".into(), false, ScrubOptions::all()),
+            Err(CoreError::InvalidState { .. })
+        ));
     }
 
     #[test]

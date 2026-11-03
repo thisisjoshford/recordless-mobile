@@ -4,7 +4,7 @@ struct RecordView: View {
     @Environment(Recorder.self) private var recorder
     @Environment(ModelStore.self) private var store
     @AppStorage("record.speechModel") private var speechModelID = ModelSpec.whisperBase.id
-    @AppStorage("record.useGpu") private var useGpu = true
+    @AppStorage(GPUSettings.speechKey) private var useGpu = false
 
     private var speechModels: [ModelSpec] { store.ready(.speech) }
     private var selected: ModelSpec? {
@@ -21,7 +21,9 @@ struct RecordView: View {
                         Picker("Speech model", selection: $speechModelID) {
                             ForEach(speechModels) { Text($0.title).tag($0.id) }
                         }
-                        Toggle("Use GPU (Metal)", isOn: $useGpu)
+                        if useGpu {
+                            Text("Speech runs on the GPU (change in Bench → Settings).").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -91,8 +93,14 @@ struct RecordView: View {
                 }
             }
         case .stopping: Label("Finishing transcription…", systemImage: "hourglass").foregroundStyle(.secondary)
-        case .stopped: Label("Meeting captured. Generate notes in the Notes tab.", systemImage: "checkmark.circle")
-            .foregroundStyle(.green)
+        case .stopped:
+            if recorder.stopFailure != nil {
+                Label("Transcript discarded: notes can't be written from this meeting.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange).multilineTextAlignment(.center)
+            } else {
+                Label("Meeting captured. Generate notes in the Notes tab.", systemImage: "checkmark.circle")
+                    .foregroundStyle(.green)
+            }
         }
     }
 

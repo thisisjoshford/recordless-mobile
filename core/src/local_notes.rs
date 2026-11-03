@@ -9,7 +9,10 @@
 //! result written up with the `confidential_meeting` template.
 //!
 //! Sizes are fitted with the model's own tokenizer to a modest context
-//! (`CONTEXT_TOKENS`) so a 2B model runs on a 6 GB phone. Every prompt, token
+//! (`CONTEXT_TOKENS`) so a 2B model runs on a 6 GB phone. The CPU is the
+//! default (as on desktop: GPU memory cannot be wiped). A GPU run whose
+//! decode fails (iOS refuses GPU work in the background) drops the GPU model,
+//! reloads on the CPU and carries on from the failed request. Every prompt, token
 //! vector and output buffer is Rust heap (wiped on free by the core's
 //! allocator); llama.cpp/ggml's own C/C++ heap is wiped by `native_wipe`.
 
@@ -57,7 +60,24 @@ const STOP_MARKER: &str = "<|im_end|>";
 pub(crate) enum LocalError {
     Cancelled,
     ModelLoad(String),
+    /// Fails the same way again, so it is not retried: context creation (out
+    /// of memory), a prompt that does not fit, summaries too long to combine.
     Inference(String),
+    /// The graph failed to compute. On the GPU this moves the run to the CPU;
+    /// on the CPU it is final.
+    Compute(String),
+    /// May succeed with a fresh context: an empty or reasoning-only answer,
+    /// or no KV slot for a batch. Retried once (desktop).
+    Transient(String),
+}
+
+impl LocalError {
+    fn decode(stage: &str, e: llama_cpp_2::DecodeError) -> Self {
+        match e {
+            llama_cpp_2::DecodeError::NoKvCacheSlot => LocalError::Transient(format!("{stage}: {e}")),
+            _ => LocalError::Compute(format!("{stage}: {e}")),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -68,6 +88,8 @@ pub(crate) struct LocalTotals {
     pub prompt_ms: u64,
     pub generate_ms: u64,
     pub requests: u32,
+    /// The run moved from the GPU to the CPU after a GPU failure.
+    pub gpu_fallback: bool,
 }
 
 pub(crate) struct LocalRun<'a> {
@@ -88,10 +110,6 @@ fn backend() -> Result<&'static LlamaBackend, String> {
         })
         .as_ref()
         .map_err(Clone::clone)
-}
-
-fn threads() -> i32 {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 4) as i32
 }
 
 /// Qwen3.5 non-thinking chat template (desktop `QWEN35_NONTHINKING_TEMPLATE`):
@@ -115,8 +133,24 @@ fn format_prompt(system: &str, user: &str) -> Zeroizing<String> {
     ))
 }
 
+/// The loaded model. `None` only between dropping the GPU model and the CPU
+/// reload, so the two are never in memory together.
 struct Loaded {
-    model: LlamaModel,
+    model: Option<LlamaModel>,
+    gpu: bool,
+}
+
+impl Loaded {
+    fn model(&self) -> &LlamaModel {
+        self.model.as_ref().expect("notes model is loaded")
+    }
+}
+
+/// Requests a chunked run is planned to make: one per chunk, a combine when
+/// there is more than one chunk (more if the summaries need several groups),
+/// and the final write-up.
+fn planned_requests(chunks: u32) -> u32 {
+    chunks + u32::from(chunks > 1) + 1
 }
 
 impl LocalRun<'_> {
@@ -126,6 +160,34 @@ impl LocalRun<'_> {
             s.request = request;
             s.requests = requests;
         }
+    }
+
+    fn set_label(&self, step: impl Into<String>) {
+        if let Ok(mut s) = self.status.lock() {
+            s.step = Some(step.into());
+        }
+    }
+
+    fn load(&self, backend: &LlamaBackend, gpu: bool) -> Result<LlamaModel, LocalError> {
+        let params = LlamaModelParams::default().with_n_gpu_layers(if gpu { 999 } else { 0 });
+        LlamaModel::load_from_file(backend, self.model_path, &params)
+            .map_err(|e| LocalError::ModelLoad(format!("notes model: {e}")))
+    }
+
+    /// Drop the GPU model, then reload on the CPU for the rest of the run.
+    fn fall_back_to_cpu(&self, backend: &LlamaBackend, loaded: &mut Loaded, totals: &mut LocalTotals) -> Result<(), LocalError> {
+        let previous = self.status.lock().ok().and_then(|s| s.step.clone());
+        self.set_label("The GPU stopped; moving to the CPU");
+        loaded.model = None; // free the GPU model before the CPU copy loads
+        loaded.gpu = false;
+        totals.gpu_fallback = true;
+        let started = Instant::now();
+        loaded.model = Some(self.load(backend, false)?);
+        totals.load_ms += started.elapsed().as_millis() as u64;
+        if let Some(step) = previous {
+            self.set_label(step);
+        }
+        self.check_cancel()
     }
 
     fn check_cancel(&self) -> Result<(), LocalError> {
@@ -141,25 +203,23 @@ impl LocalRun<'_> {
         let backend = backend().map_err(LocalError::ModelLoad)?;
         self.set_step("Loading the notes model", 0, 0);
         let started = Instant::now();
-        let params = LlamaModelParams::default().with_n_gpu_layers(if self.use_gpu { 999 } else { 0 });
-        let model = LlamaModel::load_from_file(backend, self.model_path, &params)
-            .map_err(|e| LocalError::ModelLoad(format!("notes model: {e}")))?;
+        let model = self.load(backend, self.use_gpu)?;
         totals.load_ms = started.elapsed().as_millis() as u64;
-        let loaded = Loaded { model };
+        let mut loaded = Loaded { model: Some(model), gpu: self.use_gpu };
         self.check_cancel()?;
-        let result = self.notes(backend, &loaded, scrubbed_transcript, totals);
+        let result = self.notes(backend, &mut loaded, scrubbed_transcript, totals);
         drop(loaded); // unload before returning, success or not
         result
     }
 
     fn tokens(&self, loaded: &Loaded, text: &str) -> usize {
-        loaded.model.vocab().tokenize(text.as_bytes(), false, false).len()
+        loaded.model().vocab().tokenize(text.as_bytes(), false, false).len()
     }
 
     fn notes(
         &self,
         backend: &LlamaBackend,
-        loaded: &Loaded,
+        loaded: &mut Loaded,
         transcript: &str,
         totals: &mut LocalTotals,
     ) -> Result<String, LocalError> {
@@ -188,8 +248,7 @@ impl LocalRun<'_> {
                 self.split_to_fit(loaded, rough, chunk_budget, &mut chunks);
             }
             let n = chunks.len() as u32;
-            // Planned: one per chunk, at least one combine, one final.
-            let planned = n + 1 + 1;
+            let planned = planned_requests(n);
             let mut summaries: Vec<Zeroizing<String>> = Vec::with_capacity(chunks.len());
             for (i, chunk) in chunks.iter().enumerate() {
                 self.set_step(format!("Summarising part {} of {n}", i + 1), totals.requests + 1, planned);
@@ -254,7 +313,7 @@ impl LocalRun<'_> {
     fn combine(
         &self,
         backend: &LlamaBackend,
-        loaded: &Loaded,
+        loaded: &mut Loaded,
         group: &[Zeroizing<String>],
         rules: &str,
         totals: &mut LocalTotals,
@@ -296,12 +355,15 @@ impl LocalRun<'_> {
         self.split_to_fit(loaded, b, budget, out);
     }
 
-    /// One request, retried once (desktop) unless cancelled or out of memory.
+    /// One request. A transient failure (empty answer, no KV slot) is retried
+    /// once (desktop); a GPU compute failure moves the run to the CPU and
+    /// repeats the request there (not counted as an attempt). Anything else,
+    /// including cancellation and out of memory, returns at once.
     #[allow(clippy::too_many_arguments)]
     fn complete_retrying(
         &self,
         backend: &LlamaBackend,
-        loaded: &Loaded,
+        loaded: &mut Loaded,
         system: &str,
         user: &str,
         max_output: usize,
@@ -314,11 +376,15 @@ impl LocalRun<'_> {
             let result = self.complete(backend, loaded, system, user, max_output, totals).and_then(|raw| {
                 let cleaned = clean_llm_markdown_detailed(raw.trim());
                 drop(raw);
-                require_visible_markdown(stage, &cleaned).map_err(LocalError::Inference)?;
+                require_visible_markdown(stage, &cleaned).map_err(LocalError::Transient)?;
                 Ok(Zeroizing::new(cleaned.markdown))
             });
             match result {
-                Err(LocalError::Inference(_)) if attempt < crate::notes::MAX_CHUNK_ATTEMPTS => continue,
+                Err(LocalError::Compute(_)) if loaded.gpu => {
+                    self.fall_back_to_cpu(backend, loaded, totals)?;
+                    attempt -= 1;
+                }
+                Err(LocalError::Transient(_)) if attempt < crate::notes::MAX_CHUNK_ATTEMPTS => {}
                 other => return other,
             }
         }
@@ -337,7 +403,7 @@ impl LocalRun<'_> {
     ) -> Result<Zeroizing<String>, LocalError> {
         self.check_cancel()?;
         totals.requests += 1;
-        let model = &loaded.model;
+        let model = loaded.model();
         let vocab = model.vocab();
         let prompt = format_prompt(system, user);
         let tokens = Zeroizing::new(
@@ -356,14 +422,14 @@ impl LocalRun<'_> {
             )));
         }
 
-        let threads = threads();
+        let threads = crate::inference_threads();
         let params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(CONTEXT_TOKENS))
             .with_n_batch(BATCH_TOKENS)
             .with_n_ubatch(BATCH_TOKENS)
             .with_n_threads(threads)
             .with_n_threads_batch(threads)
-            .with_offload_kqv(self.use_gpu);
+            .with_offload_kqv(loaded.gpu);
         let mut ctx: LlamaContext<'_> = model
             .new_context(backend, params)
             .map_err(|e| LocalError::Inference(format!("notes context: {e}")))?;
@@ -381,7 +447,7 @@ impl LocalRun<'_> {
                     .add(llama_cpp_2::token::LlamaToken(t), pos as i32, &[0], pos == last)
                     .map_err(|e| LocalError::Inference(format!("batch: {e}")))?;
             }
-            ctx.decode(&mut batch).map_err(|e| LocalError::Inference(format!("prompt decode: {e}")))?;
+            ctx.decode(&mut batch).map_err(|e| LocalError::decode("prompt decode", e))?;
         }
         totals.prompt_ms += started.elapsed().as_millis() as u64;
         totals.prompt_tokens += tokens.len() as u64;
@@ -424,7 +490,7 @@ impl LocalRun<'_> {
                 .add(token, pos, &[0], true)
                 .map_err(|e| LocalError::Inference(format!("batch: {e}")))?;
             pos += 1;
-            ctx.decode(&mut batch).map_err(|e| LocalError::Inference(format!("decode: {e}")))?;
+            ctx.decode(&mut batch).map_err(|e| LocalError::decode("decode", e))?;
             logits_index = 0;
         }
         totals.generate_ms += generate_started.elapsed().as_millis() as u64;
@@ -461,6 +527,19 @@ mod tests {
         let real_estimate = english.len() / 4;
         assert!(rough > real_estimate, "rough count overestimates English");
         assert!(rough_budget(5000) > 5000);
+    }
+
+    #[test]
+    fn planned_requests_counts_a_combine_only_for_several_chunks() {
+        assert_eq!(planned_requests(1), 2, "one chunk: summarise, then write up");
+        assert_eq!(planned_requests(2), 4, "two chunks, one combine, final");
+        assert_eq!(planned_requests(5), 7);
+    }
+
+    #[test]
+    fn only_a_missing_kv_slot_is_a_transient_decode_error() {
+        assert!(matches!(LocalError::decode("d", llama_cpp_2::DecodeError::NoKvCacheSlot), LocalError::Transient(_)));
+        assert!(matches!(LocalError::decode("d", llama_cpp_2::DecodeError::Unknown(-3)), LocalError::Compute(_)));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Observation
+import UIKit
 
 struct ModelSpec: Identifiable, Hashable, Sendable {
     enum Kind: Sendable { case speech, notes }
@@ -157,7 +158,8 @@ final class ModelStore {
     enum Status: Equatable {
         case missing
         case downloading(received: Int64, expected: Int64)
-        /// Hashing a file found on disk that isn't in the verified cache.
+        /// Hashing a finished download, or a file found on disk that isn't in
+        /// the verified cache.
         case verifying
         case ready(bytes: UInt64)
         case failed(String)
@@ -170,7 +172,17 @@ final class ModelStore {
     @ObservationIgnored var backgroundCompletionHandler: (() -> Void)?
 
     let directory: URL
+    /// Finished downloads wait here, unverified, until their hash is checked.
+    let stagingDirectory: URL
     @ObservationIgnored private var session: URLSession!
+    /// The download task feeding each spec's status. Callbacks from another
+    /// task (superseded), a finished task (late progress) or a cancelled
+    /// spec are ignored; a task from a previous launch is adopted.
+    @ObservationIgnored private var activeTask: [String: Int] = [:]
+    @ObservationIgnored private var finishedTasks: Set<Int> = []
+    @ObservationIgnored private var cancelledSpecs: Set<String> = []
+    /// UIKit background time held while a staged download is hashed.
+    @ObservationIgnored private var verifyBackgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
     @ObservationIgnored private let delegate = DownloadDelegate()
 
     private init() {
@@ -181,6 +193,8 @@ final class ModelStore {
         values.isExcludedFromBackup = true
         try? dir.setResourceValues(values)
         directory = dir
+        stagingDirectory = dir.appendingPathComponent(".staging", isDirectory: true)
+        try? FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
 
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.isDiscretionary = false
@@ -190,7 +204,7 @@ final class ModelStore {
         config.allowsConstrainedNetworkAccess = true
         config.timeoutIntervalForResource = 60 * 60 * 6
         delegate.store = self
-        delegate.directory = dir
+        delegate.stagingDirectory = stagingDirectory
         session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
 
         refreshFromDisk()
@@ -199,14 +213,20 @@ final class ModelStore {
             Task { @MainActor in
                 for task in tasks {
                     guard let id = task.taskDescription, task.state == .running || task.state == .suspended else { continue }
-                    ModelStore.shared.status[id] = .downloading(received: task.countOfBytesReceived,
-                                                                expected: task.countOfBytesExpectedToReceive)
+                    let store = ModelStore.shared
+                    if case .verifying = store.status[id] { continue }
+                    store.activeTask[id] = task.taskIdentifier
+                    store.status[id] = .downloading(received: task.countOfBytesReceived,
+                                                    expected: task.countOfBytesExpectedToReceive)
                 }
             }
         }
     }
 
     func fileURL(_ spec: ModelSpec) -> URL { directory.appendingPathComponent(spec.fileName) }
+    nonisolated static func stagedURL(_ spec: ModelSpec, in staging: URL) -> URL {
+        staging.appendingPathComponent(spec.fileName)
+    }
 
     func isReady(_ spec: ModelSpec) -> Bool {
         if case .ready = status[spec.id] { return true }
@@ -220,11 +240,17 @@ final class ModelStore {
     /// A file is ready only once its size and SHA-256 match the pinned spec.
     /// Files verified before (same size and modification date) are not
     /// rehashed; others are hashed off main and deleted if they don't match.
+    /// A finished download still waiting in staging (the app was suspended or
+    /// killed before its hash was checked) is verified and promoted first.
     func refreshFromDisk() {
         for spec in ModelSpec.all {
             switch status[spec.id] {
             case .downloading, .verifying: continue
             default: break
+            }
+            if FileManager.default.fileExists(atPath: Self.stagedURL(spec, in: stagingDirectory).path) {
+                verifyStaged(spec)
+                continue
             }
             let url = fileURL(spec)
             guard let (size, mtime) = ModelIntegrity.fingerprint(url) else {
@@ -266,6 +292,8 @@ final class ModelStore {
         let task = session.downloadTask(with: spec.url)
         task.taskDescription = spec.id
         task.countOfBytesClientExpectsToReceive = Int64(spec.bytes)
+        cancelledSpecs.remove(spec.id)
+        activeTask[spec.id] = task.taskIdentifier
         status[spec.id] = .downloading(received: 0, expected: Int64(spec.bytes))
         task.resume()
     }
@@ -274,6 +302,8 @@ final class ModelStore {
         session.getAllTasks { tasks in
             tasks.filter { $0.taskDescription == spec.id }.forEach { $0.cancel() }
         }
+        activeTask[spec.id] = nil
+        cancelledSpecs.insert(spec.id)
         status[spec.id] = .missing
     }
 
@@ -283,22 +313,108 @@ final class ModelStore {
         status[spec.id] = .missing
     }
 
+    /// Hash the staged download off main; promote it into place if it
+    /// matches the pinned spec, delete it if not. Runs inside a UIKit
+    /// background task so a background relaunch can usually finish; if iOS
+    /// still suspends or kills the app, the next `refreshFromDisk` resumes.
+    private func verifyStaged(_ spec: ModelSpec) {
+        let staged = Self.stagedURL(spec, in: stagingDirectory)
+        status[spec.id] = .verifying
+        let id = spec.id
+        // Next turn: this can run from `init`, before UIApplication exists.
+        Task { @MainActor in
+            let store = ModelStore.shared
+            store.endVerifyBackgroundTask(id)
+            store.verifyBackgroundTasks[id] = UIApplication.shared.beginBackgroundTask(withName: "Verify \(spec.fileName)") {
+                // Out of time: iOS suspends us; the hash resumes with the
+                // app, or a relaunch finds the staged file again.
+                MainActor.assumeIsolated { ModelStore.shared.endVerifyBackgroundTask(id) }
+            }
+            Task.detached(priority: .utility) {
+                let result = Result { try ModelIntegrity.verify(staged, against: spec) }
+                await MainActor.run {
+                    ModelStore.shared.promoteStaged(spec, from: staged, verified: result)
+                    ModelStore.shared.endVerifyBackgroundTask(id)
+                }
+            }
+        }
+    }
+
+    private func endVerifyBackgroundTask(_ id: String) {
+        guard let task = verifyBackgroundTasks.removeValue(forKey: id), task != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
+    private func promoteStaged(_ spec: ModelSpec, from staged: URL, verified: Result<Void, Error>) {
+        let fm = FileManager.default
+        guard case .verifying = status[spec.id] else {
+            try? fm.removeItem(at: staged)
+            return
+        }
+        do {
+            try verified.get()
+            let dest = fileURL(spec)
+            ModelIntegrity.forget(spec)
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.moveItem(at: staged, to: dest)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var mutableDest = dest
+            try? mutableDest.setResourceValues(values)
+            guard let file = ModelIntegrity.fingerprint(dest) else {
+                throw AppError("The model file disappeared after download")
+            }
+            ModelIntegrity.remember(spec, size: file.size, mtime: file.mtime)
+            status[spec.id] = .ready(bytes: file.size)
+        } catch {
+            try? fm.removeItem(at: staged)
+            status[spec.id] = .failed(error.localizedDescription)
+        }
+    }
+
     // MARK: Delegate callbacks (main actor)
 
-    fileprivate func progress(id: String, received: Int64, expected: Int64) {
+    /// Whether a callback from `task` may change `id`'s status. A task not
+    /// seen before (from a previous launch) is adopted.
+    private func accepts(_ id: String, task: Int) -> Bool {
+        guard !finishedTasks.contains(task), !cancelledSpecs.contains(id) else { return false }
+        if let active = activeTask[id] { return active == task }
+        activeTask[id] = task
+        return true
+    }
+
+    private func retire(_ id: String, task: Int) {
+        finishedTasks.insert(task)
+        activeTask[id] = nil
+    }
+
+    fileprivate func progress(id: String, task: Int, received: Int64, expected: Int64) {
+        switch status[id] {
+        case .verifying, .ready: return     // never revert a finished download
+        default: break
+        }
+        guard accepts(id, task: task) else { return }
         status[id] = .downloading(received: received, expected: expected)
     }
 
-    /// `.success` carries the verified file's fingerprint for the cache.
-    fileprivate func finished(id: String, result: Result<(size: UInt64, mtime: TimeInterval), Error>) {
-        switch result {
-        case .success(let file):
-            if let spec = ModelSpec.all.first(where: { $0.id == id }) {
-                ModelIntegrity.remember(spec, size: file.size, mtime: file.mtime)
+    /// The download finished and was moved to staging; verify it.
+    fileprivate func staged(id: String, task: Int) {
+        guard let spec = ModelSpec.all.first(where: { $0.id == id }) else { return }
+        guard accepts(id, task: task) else {
+            // Cancelled or superseded after the bytes arrived.
+            if activeTask[id] == nil {
+                try? FileManager.default.removeItem(at: Self.stagedURL(spec, in: stagingDirectory))
             }
-            status[id] = .ready(bytes: file.size)
-        case .failure(let error): status[id] = .failed(error.localizedDescription)
+            return
         }
+        retire(id, task: task)
+        verifyStaged(spec)
+    }
+
+    fileprivate func failed(id: String, task: Int, error: Error) {
+        guard accepts(id, task: task) else { return }
+        retire(id, task: task)
+        status[id] = .failed(error.localizedDescription)
     }
 
     fileprivate func finishBackgroundEvents() {
@@ -309,7 +425,7 @@ final class ModelStore {
 
 private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     weak var store: ModelStore?
-    var directory: URL!
+    var stagingDirectory: URL!
     /// Throttle progress updates to ~4/s per task.
     private var lastTick: [String: Date] = [:]
     private let lock = NSLock()
@@ -318,6 +434,7 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unc
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
         guard let id = downloadTask.taskDescription else { return }
+        let taskID = downloadTask.taskIdentifier
         let now = Date()
         let shouldEmit = lock.withLock { () -> Bool in
             if let last = lastTick[id], now.timeIntervalSince(last) < 0.25 { return false }
@@ -326,49 +443,40 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unc
         }
         guard shouldEmit else { return }
         Task { @MainActor [weak store] in
-            store?.progress(id: id, received: totalBytesWritten, expected: totalBytesExpectedToWrite)
+            store?.progress(id: id, task: taskID, received: totalBytesWritten, expected: totalBytesExpectedToWrite)
         }
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
-        // The temp file is deleted when this method returns, so verify and move
-        // it synchronously. This runs on the session's delegate queue (never
-        // main); the hash streams from disk.
+        // The temp file is deleted when this method returns, and a background
+        // relaunch has little time, so only move it to staging here (a
+        // rename). Hashing 1.3-2.7 GB happens afterwards, off main
+        // (`ModelStore.verifyStaged`); nothing is used until it passes.
         guard let id = downloadTask.taskDescription,
               let spec = ModelSpec.all.first(where: { $0.id == id }) else { return }
+        let taskID = downloadTask.taskIdentifier
         let fm = FileManager.default
-        let result: Result<(size: UInt64, mtime: TimeInterval), Error>
         do {
             if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 throw NSError(domain: "ModelStore", code: http.statusCode,
                               userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])
             }
-            // Only a file matching the pinned size and SHA-256 is moved into place.
-            try ModelIntegrity.verify(location, against: spec)
-            let dest = directory.appendingPathComponent(spec.fileName)
-            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-            try fm.moveItem(at: location, to: dest)
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            var mutableDest = dest
-            try? mutableDest.setResourceValues(values)
-            guard let file = ModelIntegrity.fingerprint(dest) else {
-                throw NSError(domain: "ModelStore", code: -1,
-                              userInfo: [NSLocalizedDescriptionKey: "The model file disappeared after download"])
-            }
-            result = .success(file)
+            let staged = ModelStore.stagedURL(spec, in: stagingDirectory)
+            if fm.fileExists(atPath: staged.path) { try fm.removeItem(at: staged) }
+            try fm.moveItem(at: location, to: staged)
+            Task { @MainActor [weak store] in store?.staged(id: id, task: taskID) }
         } catch {
             try? fm.removeItem(at: location)
-            result = .failure(error)
+            Task { @MainActor [weak store] in store?.failed(id: id, task: taskID, error: error) }
         }
-        Task { @MainActor [weak store] in store?.finished(id: id, result: result) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error, let id = task.taskDescription else { return }
         if (error as NSError).code == NSURLErrorCancelled { return }
-        Task { @MainActor [weak store] in store?.finished(id: id, result: .failure(error)) }
+        let taskID = task.taskIdentifier
+        Task { @MainActor [weak store] in store?.failed(id: id, task: taskID, error: error) }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

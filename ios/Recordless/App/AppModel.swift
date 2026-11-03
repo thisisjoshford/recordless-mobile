@@ -102,6 +102,15 @@ enum Format {
     }
 }
 
+/// GPU (Metal) switches for speech and on-device notes. Both are off by
+/// default, as on desktop: the CPU's memory is wiped on free, GPU memory
+/// can't be. (New keys, so installs that had the old GPU default start on
+/// the CPU.)
+enum GPUSettings {
+    static let speechKey = "settings.speechUseGpu"
+    static let notesKey = "settings.notesUseGpu"
+}
+
 /// Small helper to run a blocking core call off the main actor.
 func offMain<T>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
     try await Task.detached(priority: .userInitiated) { try work() }.value

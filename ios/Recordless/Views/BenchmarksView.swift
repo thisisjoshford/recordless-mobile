@@ -21,6 +21,7 @@ struct BenchmarksView: View {
                 StatRow(label: "Whisper runs / failed / empty", value: "\(d.inferenceRuns) / \(d.inferenceFailures) / \(d.emptyResults)")
                 StatRow(label: "Last inference", value: "\(d.lastInferenceMs) ms")
                 if d.gpuFallback { StatRow(label: "GPU", value: "failed, moved to CPU") }
+                if d.speechUnavailable { StatRow(label: "Speech model", value: "CPU reload failed; rest not transcribed") }
             }
             if recorder.captureStats == nil && recorder.diagnostics == nil {
                 Text("Record something to see the microphone path.").foregroundStyle(.secondary)
@@ -38,9 +39,21 @@ struct BenchmarksView: View {
     @State private var peak: UInt64 = 0
     @State private var available: Int = 0
     @State private var version = ""
+    @AppStorage(GPUSettings.speechKey) private var speechUseGpu = false
 
     var body: some View {
+        @Bindable var gen = gen
         List {
+            Section {
+                Toggle("Speech on GPU (Metal)", isOn: $speechUseGpu)
+                    .disabled(recorder.phase != .idle)
+                Toggle("On-device notes on GPU (Metal)", isOn: $gen.localUseGpu)
+                    .disabled(gen.running)
+            } header: {
+                Text("Settings")
+            } footer: {
+                Text("Off by default, as on desktop: memory the CPU used is wiped when freed, GPU memory can't be. The GPU is faster. iOS refuses GPU work in the background, so a GPU run then moves to the CPU. Speech applies from the next recording.")
+            }
             Section("Memory (live)") {
                 StatRow(label: "phys_footprint", value: Format.bytes(footprint))
                 StatRow(label: "Peak footprint", value: Format.bytes(peak))
@@ -73,7 +86,8 @@ struct BenchmarksView: View {
                         StatRow(label: "Prefill", value: String(format: "%.0f tokens/s", l.promptTokensPerS))
                         StatRow(label: "Generation", value: String(format: "%.1f tokens/s", l.tokensPerS))
                         StatRow(label: "Peak footprint", value: Format.bytes(l.peakFootprintBytes))
-                        StatRow(label: "Context / backend", value: "\(l.contextTokens) · \(l.gpu ? "GPU" : "CPU")")
+                        StatRow(label: "Context / backend",
+                                value: "\(l.contextTokens) · \(l.gpu ? (l.gpuFallback ? "GPU, then CPU" : "GPU") : "CPU")")
                     }
                 } else {
                     Text("No run yet").foregroundStyle(.secondary)

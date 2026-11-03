@@ -55,6 +55,7 @@ record SessionDiagnostics {  // counts and whole-dBFS levels only; no audio, no 
   level_dbfs: i32, noise_floor_dbfs: i32, threshold_dbfs: i32,  // loudest frame in last ~1 s
   inference_runs: u64, inference_failures: u64, empty_results: u64, last_inference_ms: u64,
   gpu_fallback: bool,      // a GPU run failed; speech moved to the CPU for the session
+  speech_unavailable: bool,// ...and the CPU reload failed: nothing more is transcribed (incomplete)
 }
 
 record SpeechStats { load_ms: u64, realtime_factor: f64 }   // audio secs / compute secs
@@ -66,7 +67,8 @@ record LocalNotesStats {
   prompt_tokens_per_s: f64, tokens_per_s: f64,           // prefill / generation
   context_tokens: u32,     // 8192
   peak_footprint_bytes: u64,                             // ledger peak when the run ended
-  gpu: bool,
+  gpu: bool,               // started on the GPU
+  gpu_fallback: bool,      // a GPU request failed; the rest of the run used the CPU
 }
 
 record NotesResult {
@@ -113,7 +115,8 @@ object Session {
   constructor new(speech_model_path: String, use_gpu: bool) -> Result<Session, CoreError>
   fn push_audio(samples: Vec<f32>) -> Result<(), CoreError>   // 16 kHz mono f32, any chunk size
   fn progress() -> SessionProgress
-  fn stop() -> Result<SessionProgress, CoreError>              // drains, then unloads speech model
+  fn stop() -> Result<SessionProgress, CoreError>              // drains, then unloads speech model;
+                                                               // MemoryLock = transcript wiped
   fn speech_stats() -> SpeechStats
   fn diagnostics() -> SessionDiagnostics
   fn generate_notes_on_device(model_path: String, use_gpu: bool, scrub: ScrubOptions)
@@ -177,25 +180,34 @@ Surface above is implemented as written. Details the Swift side can rely on:
   SE key or blob (e.g. passcode removed) makes the vault permanently unreadable; the app sets
   the file aside under `vault-set-aside-<time>` and never deletes it.
 - `Session.new` fails with `MemoryLock` if `mlock` or core-dump disabling fails. A later
-  lock failure marks `incomplete` and makes `stop()` return `MemoryLock`.
+  lock failure marks `incomplete`; `stop()` then wipes the transcript (desktop discards it
+  on a protected-processing failure) and returns `MemoryLock` on every call, so notes
+  can't be generated from it (`InvalidState`: no speech).
 - `stop()` is idempotent; `push_audio` after `stop()`/`discard()` is `InvalidState`.
   `generate_notes` before `stop()` or with no transcribed speech is `InvalidState`.
 - VAD is a simple energy VAD (30 ms frames, adaptive floor, 750 ms hangover, 28 s cap).
-  Whisper runs English-only, greedy, `use_gpu` + flash-attn toggled together. If a GPU
+  Whisper runs English-only, greedy, `use_gpu` + flash-attn toggled together. The app
+  passes `use_gpu: false` by default (as desktop; GPU memory can't be wiped). If a GPU
   run fails (iOS refuses GPU work in the background, e.g. screen locked), the session
-  reloads the model on the CPU, retries that utterance and stays on the CPU
-  (`diagnostics().gpu_fallback`).
+  drops the GPU state, then reloads the model on the CPU, retries that utterance and
+  stays on the CPU (`diagnostics().gpu_fallback`). If the CPU reload fails, later
+  utterances are counted as failures without retrying (`speech_unavailable`, `incomplete`).
+  Whisper and llama.cpp share one thread count (`inference_threads`, at most 4).
 - **On-device notes** (`generate_notes_on_device`, `core/src/local_notes.rs`). Needs
   `stop()` first (so the speech model is unloaded) and no other request on the session.
-  Loads the GGUF (`n_gpu_layers` all or 0), runs, and drops model and contexts before
-  returning. Context 8192 tokens, a fresh context per request; budgets are measured with
+  Loads the GGUF (`n_gpu_layers` all or 0; the app passes `use_gpu: false` by default),
+  runs, and drops model and contexts before returning. If a GPU decode fails (iOS refuses
+  GPU work in the background), the GPU model is dropped, the model reloaded on the CPU and
+  the failed request repeated there; later steps stay on the CPU (`local.gpu_fallback`). Context 8192 tokens, a fresh context per request; budgets are measured with
   the model's tokenizer: final notes get up to 1536 output tokens, chunks 640, combines
   1024. A transcript that does not fit one final request is chunked (desktop
   `chunk_text`, re-split until each chunk fits), each chunk summarised, the summaries
   combined in groups that fit, then written up with the `confidential_meeting` template.
   Qwen3.5 non-thinking chat template and desktop's `qwen35_summary` sampling (temp 0.5,
-  top-k 20, top-p 0.8, presence 0.3, repeat 1.05 over 256). An empty or reasoning-only
-  answer is retried once. Errors: `ModelLoad` (GGUF), `LocalNotes` (inference),
+  top-k 20, top-p 0.8, presence 0.3, repeat 1.05 over 256). Only transient failures
+  (an empty or reasoning-only answer, no KV slot) are retried, once; context creation
+  (out of memory), a prompt that does not fit and CPU compute failures are not. A chunked
+  run plans chunks + 1 combine (only with 2+ chunks) + final requests. Errors: `ModelLoad` (GGUF), `LocalNotes` (inference),
   `Cancelled`. `notes_status()` reports steps ("Summarising part 2 of 3", …).
   `verification` is `None`; `local` has the timings.
 - **Private cloud notes** (`core/src/notes.rs`, `core/src/nearai/`). `generate_notes`

@@ -49,8 +49,11 @@ pub struct LocalNotesStats {
     pub context_tokens: u32,
     /// Process peak footprint (`ledger_phys_footprint_peak`) when the run ended.
     pub peak_footprint_bytes: u64,
-    /// The model ran on the GPU (Metal); false means CPU only.
+    /// The run started on the GPU (Metal); false means CPU only.
     pub gpu: bool,
+    /// A GPU request failed (for example because the app went to the
+    /// background) and the rest of the run moved to the CPU.
+    pub gpu_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]

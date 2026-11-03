@@ -108,6 +108,9 @@ pub struct SessionDiagnostics {
     /// The GPU failed (for example while the screen was locked) and speech
     /// moved to the CPU for the rest of the session.
     pub gpu_fallback: bool,
+    /// Reloading the speech model on the CPU after a GPU failure also failed:
+    /// the rest of the audio is not transcribed (`incomplete` is set).
+    pub speech_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
@@ -132,6 +135,11 @@ pub fn phys_footprint_bytes() -> u64 {
 #[uniffi::export]
 pub fn peak_footprint_bytes() -> u64 {
     memory::peak_footprint_bytes()
+}
+
+/// CPU threads for whisper and llama.cpp (shared so speech and notes agree).
+pub(crate) fn inference_threads() -> i32 {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 4) as i32
 }
 
 /// Route whisper.cpp, llama.cpp and ggml logging into the void. They do not

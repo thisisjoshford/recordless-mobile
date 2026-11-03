@@ -14,11 +14,12 @@ import UIKit
 ///   scripts/make-selftest-fixture.sh) through `Session.push_audio` in 100 ms
 ///   chunks at real time (`-selftest-speed N` for N x), then stops and prints
 ///   progress, diagnostics, realtime factor and memory.
-///   `-selftest-cpu` runs whisper on the CPU instead of Metal.
+///   Whisper runs on the CPU (the default); `-selftest-gpu` uses Metal.
 /// - `-selftest-notes`: then writes notes on the device from that transcript
 ///   (downloading and verifying the notes model through ModelStore if
 ///   needed) and prints load time, tokens/s and peak footprint.
-///   `-selftest-notes-cpu` runs the notes model on the CPU.
+///   The notes model runs on the CPU (the default); `-selftest-notes-gpu`
+///   uses Metal.
 /// - `-selftest-exit`: quit after printing the result (otherwise the app
 ///   stays up, notes on the Notes tab).
 /// - `-mictest N`: records from the real microphone for N seconds through
@@ -101,12 +102,12 @@ enum SelfTest {
             + "frames=\(d.vadFrames) speech_frames=\(d.vadSpeechFrames) level_db=\(d.levelDbfs) "
             + "noise_db=\(d.noiseFloorDbfs) thr_db=\(d.thresholdDbfs) utt=\(d.utterances) dropped=\(d.utterancesDropped) "
             + "runs=\(d.inferenceRuns) fail=\(d.inferenceFailures) empty=\(d.emptyResults) last_ms=\(d.lastInferenceMs) "
-            + "gpu_fallback=\(d.gpuFallback)"
+            + "gpu_fallback=\(d.gpuFallback) speech_unavailable=\(d.speechUnavailable)"
     }
 
     static func speechAndNotes(_ app: AppModel, args: [String]) async {
         UIApplication.shared.isIdleTimerDisabled = true
-        let useGpu = !args.contains("-selftest-cpu")
+        let useGpu = args.contains("-selftest-gpu")
         let speed = args.firstIndex(of: "-selftest-speed").flatMap { args.indices.contains($0 + 1) ? Double(args[$0 + 1]) : nil } ?? 1
         let wantNotes = args.contains("-selftest-notes")
         log("start: core=\(coreVersion()) device_ram=\(mb(ProcessInfo.processInfo.physicalMemory)) "
@@ -166,7 +167,7 @@ enum SelfTest {
         log("speech \(ok ? "PASS" : "FAIL"): \(stopped.segments) segments from \(d.utterances) utterances")
 
         if ok && wantNotes {
-            let notesGpu = !args.contains("-selftest-notes-cpu")
+            let notesGpu = args.contains("-selftest-notes-gpu")
             if let llm = await ensureModel(.qwen2B, store: app.models) {
                 log("notes: on device via NotesGenerator (the UI path), gpu=\(notesGpu), "
                     + "footprint before \(mb(physFootprintBytes())), available \(mb(UInt64(max(os_proc_available_memory(), 0))))")
@@ -189,7 +190,7 @@ enum SelfTest {
                         log("notes: model=\(r.modelId) requests=\(r.requests) prompt_tokens=\(r.promptTokens) "
                             + "generated_tokens=\(r.generatedTokens) load_ms=\(l.loadMs) prefill=\(String(format: "%.0f", l.promptTokensPerS)) tok/s "
                             + "generation=\(String(format: "%.1f", l.tokensPerS)) tok/s elapsed_ms=\(r.elapsedMs) "
-                            + "ctx=\(l.contextTokens) gpu=\(l.gpu) peak_footprint=\(mb(l.peakFootprintBytes))")
+                            + "ctx=\(l.contextTokens) gpu=\(l.gpu) gpu_fallback=\(l.gpuFallback) peak_footprint=\(mb(l.peakFootprintBytes))")
                     }
                     log("notes: \(r.markdown.count) chars, \(headings) heading lines (text not printed); shown on the Notes tab")
                     ok = ok && !r.markdown.isEmpty
@@ -213,7 +214,7 @@ enum SelfTest {
         UIApplication.shared.isIdleTimerDisabled = true
         guard let whisper = await ensureModel(.whisperBase, store: app.models) else { return await finish(false) }
         log("mic test: \(Int(seconds)) s through the normal Recorder path")
-        await app.recorder.start(speechModel: whisper, useGpu: !ProcessInfo.processInfo.arguments.contains("-selftest-cpu"))
+        await app.recorder.start(speechModel: whisper, useGpu: ProcessInfo.processInfo.arguments.contains("-selftest-gpu"))
         guard app.recorder.phase == .recording else {
             log("recorder did not start: \(app.recorder.lastError ?? "?")")
             return await finish(false)

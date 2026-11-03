@@ -32,10 +32,10 @@ final class NotesGenerator {
         didSet { UserDefaults.standard.set(localModelID, forKey: Self.localModelKey) }
     }
     private static let localModelKey = "generate.localModel"
+    /// Off by default (as on desktop: GPU memory can't be wiped).
     var localUseGpu: Bool {
-        didSet { UserDefaults.standard.set(localUseGpu, forKey: Self.localGpuKey) }
+        didSet { UserDefaults.standard.set(localUseGpu, forKey: GPUSettings.notesKey) }
     }
-    private static let localGpuKey = "generate.localGpu"
 
     /// Scrub categories. Every one starts on for each new session.
     var scrubEmails = true
@@ -67,6 +67,9 @@ final class NotesGenerator {
     var error: String?
 
     @ObservationIgnored private var scrubSession: ObjectIdentifier?
+    /// Bumped when a request starts and ends, so a status poll still in
+    /// flight from an earlier run (or after this one ended) is dropped.
+    @ObservationIgnored private var runToken = 0
     /// Keeps the request running for a while after the user switches apps.
     @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// iOS ran out of background time and the request was cancelled.
@@ -83,7 +86,7 @@ final class NotesGenerator {
         selectedModelID = d.string(forKey: Self.modelKey)
         location = d.string(forKey: Self.locationKey).flatMap(NotesWhere.init(rawValue:)) ?? .onDevice
         localModelID = d.string(forKey: Self.localModelKey) ?? ModelSpec.qwen2B.id
-        localUseGpu = d.object(forKey: Self.localGpuKey) as? Bool ?? true
+        localUseGpu = d.bool(forKey: GPUSettings.notesKey)
     }
 
     var scrub: ScrubOptions {
@@ -169,12 +172,14 @@ final class NotesGenerator {
     }
 
     /// On-device notes with the GGUF at `model`. The screen is kept awake
-    /// while it runs: iOS refuses GPU work from the background.
+    /// while it runs: the background time iOS grants is short, and it refuses
+    /// GPU work there (the core then moves a GPU run to the CPU).
     func generateOnDevice(session: Session, model: URL, useGpu: Bool) async {
         let scrub = self.scrub
         let path = model.path
+        let idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
-        defer { UIApplication.shared.isIdleTimerDisabled = false }
+        defer { UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled }
         await run(session: session, taskName: "On-device notes") {
             try session.generateNotesOnDevice(modelPath: path, useGpu: useGpu, scrub: scrub)
         }
@@ -184,6 +189,8 @@ final class NotesGenerator {
                      _ work: @escaping @Sendable () throws -> NotesResult) async {
         guard !running else { return }
         running = true
+        runToken += 1
+        let token = runToken
         error = nil
         result = nil
         status = nil
@@ -193,11 +200,13 @@ final class NotesGenerator {
             onFinished?()
         }
 
-        // Poll the core's step labels while the request runs.
+        // Poll the core's step labels while the request runs. A poll that
+        // returns after this run ended (or another began) is dropped.
         let poller = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 let s = await Task.detached { session.notesStatus() }.value
-                self?.status = s
+                guard let self, !Task.isCancelled, self.runToken == token else { return }
+                self.status = s
                 try? await Task.sleep(for: .milliseconds(300))
             }
         }
@@ -219,6 +228,7 @@ final class NotesGenerator {
             verification = session.notesStatus().lastVerification
         }
         wallMs = UInt64(Date().timeIntervalSince(t0) * 1000)
+        runToken += 1
         poller.cancel()
         status = nil
     }

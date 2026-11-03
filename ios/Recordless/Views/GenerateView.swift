@@ -34,6 +34,7 @@ struct GenerateView: View {
         case .stopped:
             break
         }
+        if let failure = recorder.stopFailure { return failure }
         guard recorder.session != nil else { return "Record and stop a meeting first." }
         if (recorder.progress?.segments ?? 0) == 0 {
             return "No speech was transcribed in this meeting, so there is nothing to write notes from. Check Bench for the microphone diagnostics."
@@ -228,7 +229,7 @@ struct GenerateView: View {
         } header: {
             Text("On-device model")
         } footer: {
-            Text("Runs in the app with an 8k-token context; long meetings are summarised in parts and combined. The GPU is much faster; the CPU works too.")
+            Text("Runs in the app with an 8k-token context; long meetings are summarised in parts and combined. The CPU is the default because, as on desktop, GPU memory can't be wiped. The GPU is faster; if the app goes to the background, a GPU run moves to the CPU.")
         }
         .disabled(gen.running)
     }

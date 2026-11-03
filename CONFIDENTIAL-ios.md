@@ -49,14 +49,22 @@ device.
 3. **Process in memory.** Only the **microphone** is captured (no system or
    other-app audio; iOS does not allow it). Audio is converted to 16 kHz mono
    PCM and voice-activity filtered in memory; no audio files, checkpoints or
-   recordings folder are created. Background audio mode keeps capture running
+   recordings folder are created. Speech runs on the **CPU by default**, as
+   on desktop, because memory the CPU used is wiped when freed and GPU memory
+   cannot be (Limits). The GPU (Metal) is a setting, off by default (Bench →
+   Settings); if GPU work fails (iOS refuses it in the background), the GPU
+   copy is freed, the model is reloaded on the CPU and the session stays
+   there; if that reload fails, the rest of the audio is not transcribed and
+   the session is marked incomplete. Background audio mode keeps capture running
    with the screen locked. Transcript segments are held in page-aligned,
    `mlock`ed memory that is zeroed on release. Swift receives counts, timings
    and one coarse loudness value, never transcript text.
 4. **Stop.** Capture stops, queued audio drains, and the Whisper model is
-   unloaded before notes can be requested. A locked-memory failure is reported
-   from `stop()`; failed inference for part of the audio keeps what succeeded
-   and marks the session incomplete. Unprocessed audio is lost on exit or
+   unloaded before notes can be requested. A locked-memory failure during the
+   session is a protected-processing failure: as on desktop, `stop()` wipes
+   the transcript and reports it, and the app says notes can't be written
+   from that meeting. Failed inference for part of the audio keeps what
+   succeeded and marks the session incomplete. Unprocessed audio is lost on exit or
    crash by design.
 5. **Generate notes (on this device by default, or private cloud).** The
    Notes screen chooses where: **On this device** (the default) or **Private
@@ -76,14 +84,17 @@ device.
    **On this device (default).** The downloaded GGUF model (Qwen 3.5 2B Q4_K_M
    on a 6 GB iPhone; the 4B model is offered only with 8 GB or more) is loaded
    by llama.cpp **in the app process**, used and unloaded within the one
-   request; the Whisper model is already unloaded by then. It runs on the GPU
-   (Metal) by default or on the CPU (a toggle). Nothing is sent anywhere. The
-   context is 8k tokens; a long meeting is summarised in parts, combined and
-   written up (the same flow as the private cloud and desktop), so it takes
-   longer but never needs a larger context. iOS does not let an app use the
-   GPU in the background, so the screen is kept on while notes are written; if
-   the app is backgrounded anyway the run fails or is cancelled and the
-   transcript is kept for retry. Prompts, token lists and output are Rust heap
+   request; the Whisper model is already unloaded by then. It runs on the
+   **CPU by default**, as on desktop (GPU memory cannot be wiped); the GPU
+   (Metal) is a setting, off by default (Notes screen and Bench → Settings).
+   Nothing is sent anywhere. The context is 8k tokens; a long meeting is
+   summarised in parts, combined and written up (the same flow as the private
+   cloud and desktop), so it takes longer but never needs a larger context.
+   The screen is kept on while notes are written. iOS does not let an app use
+   the GPU in the background: if a GPU run fails there, the GPU model is
+   freed, the model is reloaded on the CPU and the run carries on from the
+   failed step. Background time is short, so if iOS ends it the run is
+   cancelled and the transcript is kept for retry. Prompts, token lists and output are Rust heap
    (wiped on free); llama.cpp's and ggml's C/C++ heap is wiped as for Whisper
    (Limits). The model weights are read from the file through a read-only
    memory map.
@@ -270,7 +281,9 @@ transcript storage.
   wipe their own key material, not every buffer); Metal **private** (GPU-only)
   buffers, used only if the device reports no shared buffers; GPU caches,
   driver and kernel copies, freed pages handed back to the kernel, and thread
-  stacks; Swift strings, including the generated notes, the note text read from
+  stacks (so the CPU is the default for speech and notes; with the GPU
+  setting on, activations and the KV cache also pass through GPU-side
+  copies that are not wiped); Swift strings, including the generated notes, the note text read from
   the notebook, and error messages; and anything still allocated when the app
   is killed or crashes. Zeroing on free does not cover live data, copies the
   compiler keeps in registers or on the stack, or memory iOS has already

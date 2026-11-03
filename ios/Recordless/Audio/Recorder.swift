@@ -12,7 +12,7 @@ final class Recorder {
         case loadingModel
         case recording
         case stopping
-        case stopped      // session holds a transcript; notes can be generated
+        case stopped      // session holds a transcript; notes can be generated unless stopFailure is set
     }
 
     private(set) var phase: Phase = .idle
@@ -29,6 +29,10 @@ final class Recorder {
     private(set) var diagnostics: SessionDiagnostics?
     private(set) var captureStats: CaptureStats?
     var lastError: String?
+    /// `stop()` failed (a locked-memory failure is a protected-processing
+    /// failure: the core discards the transcript, as desktop does). Notes
+    /// can't be written from this meeting; this says why.
+    private(set) var stopFailure: String?
 
     /// The stopped session, handed to NotesGenerator. Cleared on discard.
     private(set) var session: Session?
@@ -77,6 +81,7 @@ final class Recorder {
         generation += 1
         let gen = generation
         lastError = nil
+        stopFailure = nil
         let allowed = await AVAudioApplication.requestRecordPermission()
         guard gen == generation else { return }    // discarded meanwhile
         guard allowed else {
@@ -153,12 +158,21 @@ final class Recorder {
         guard gen == generation else { return }    // discarded meanwhile: stay idle
         switch stopped {
         case .success(let p): progress = p
-        case .failure(let error): lastError = "stop(): \(describe(error))"
+        case .failure(let error):
+            if case CoreError.MemoryLock = error {
+                stopFailure = "Protected memory failed while recording, so the transcript was discarded and notes can't be written from this meeting. Discard it and record again."
+            } else {
+                stopFailure = "Stopping the recording failed (\(describe(error))), so notes can't be written from this meeting. Discard it and record again."
+            }
+            lastError = "stop(): \(describe(error))"
         }
-        let stats = try? await offMain { (session.speechStats(), session.diagnostics()) }
+        // After a failure too: whatever the session still reports, not the
+        // last live poll.
+        let stats = try? await offMain { (session.speechStats(), session.diagnostics(), session.progress()) }
         guard gen == generation else { return }
         speechStats = stats?.0
         diagnostics = stats?.1
+        if stopFailure != nil { progress = stats?.2 }
         captureStats = capture.stats
         #if DEBUG
         if let d = diagnostics, let c = captureStats { Self.log(progress, d, c, final: true) }
@@ -178,6 +192,7 @@ final class Recorder {
         }
         session = nil
         progress = nil
+        stopFailure = nil
         startedAt = nil
         stoppedAt = nil
         interrupted = false
