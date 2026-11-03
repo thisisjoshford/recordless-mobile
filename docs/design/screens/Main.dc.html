@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unlock notebook</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&amp;family=Source+Sans+3:wght@400;600;700&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#283962}a:hover{color:#1B2D55}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #FBFAF7; color: #111827; font-family: 'Source Sans 3', -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; padding: 0 28px 48px">
+  <div style="flex-grow: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; text-align: center">
+    <svg width="104" height="104" viewBox="0 0 500 500" aria-hidden="true"><rect x="50" y="50" width="400" height="400" rx="94" fill="#F9F8F5"></rect><rect x="50.5" y="50.5" width="399" height="399" rx="93.5" fill="none" stroke="#E4DFD8" stroke-width="2"></rect><path d="M112 170V124a12 12 0 0 1 12-12H170M330 112H376a12 12 0 0 1 12 12V170M388 330V376a12 12 0 0 1-12 12H330M170 388H124a12 12 0 0 1-12-12V330" fill="none" stroke="#223868" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"></path><circle cx="250" cy="250" r="72" fill="#E5362F"></circle><line x1="188" y1="312" x2="312" y2="188" stroke="#223868" stroke-width="26" stroke-linecap="round"></line></svg>
+    <h1 style="margin: 0; font-family: 'Instrument Serif', Georgia, serif; font-weight: 400; font-size: 44px; line-height: 1; letter-spacing: -0.5px; color: #111827">Recordless</h1>
+    <p style="margin: 0; font-size: 17px; line-height: 1.4; color: #6C6660; max-width: 260px">Meeting notes without the recording.</p>
+  </div>
+  <div style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 14px">
+    <div style="display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px; background: #F4F1EB; color: #6C6660; font-size: 14px; font-weight: 600">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#111827" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
+      <span>Notebook locked</span>
+    </div>
+    <button type="button" style="width: 100%; height: 54px; border: 0; border-radius: 14px; background: #283962; color: #FCFBF8; font-family: inherit; font-size: 17px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 10px; cursor: pointer">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path><path d="M9 9v1M15 9v1M12 9v4h-1M9.5 15.5a3.5 3.5 0 0 0 5 0"></path></svg>
+      <span>Unlock with Face ID</span>
+    </button>
+    <a href="#passphrase" style="min-height: 44px; display: flex; align-items: center; font-size: 16px; font-weight: 600; text-decoration: none">Use passphrase instead</a>
+    <p style="margin: 6px 0 0; font-size: 13px; line-height: 1.45; color: #6C6660; text-align: center; max-width: 300px">Your notes are encrypted on this device. Recordless never stores audio or transcripts.</p>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

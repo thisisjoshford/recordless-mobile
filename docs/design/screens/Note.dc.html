@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Note</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&amp;family=Source+Sans+3:wght@400;600;700&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#283962}a:hover{color:#1B2D55}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #FBFAF7; color: #111827; font-family: 'Source Sans 3', -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden">
+  <nav aria-label="Note" style="flex-shrink: 0; padding: 52px 8px 4px; display: flex; align-items: center; justify-content: space-between">
+    <a href="Home.dc.html" style="min-height: 44px; display: flex; align-items: center; gap: 2px; padding: 0 8px; font-size: 17px; text-decoration: none">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+      <span>Notes</span>
+    </a>
+    <div style="display: flex; gap: 2px">
+      <button type="button" aria-label="Share" style="width: 44px; height: 44px; border: 0; background: transparent; display: flex; align-items: center; justify-content: center; cursor: pointer">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#283962" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12M8 7l4-4 4 4"></path><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"></path></svg>
+      </button>
+      <button type="button" aria-label="More actions" style="width: 44px; height: 44px; border: 0; background: transparent; display: flex; align-items: center; justify-content: center; cursor: pointer">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="#283962" aria-hidden="true"><circle cx="5" cy="12" r="1.8"></circle><circle cx="12" cy="12" r="1.8"></circle><circle cx="19" cy="12" r="1.8"></circle></svg>
+      </button>
+    </div>
+  </nav>
+
+  <article style="flex-grow: 1; min-height: 0; padding: 4px 20px 16px; display: flex; flex-direction: column; gap: 16px; overflow: hidden">
+    <header style="display: flex; flex-direction: column; gap: 8px">
+      <h1 style="margin: 0; font-size: 30px; line-height: 1.15; font-weight: 700">[Meeting title]</h1>
+      <p style="margin: 0; font-size: 15px; color: #6C6660">Today · 2:30 PM · 32 min</p>
+      <div style="display: flex; flex-wrap: wrap; gap: 6px">
+        <span style="display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; background: #F4F1EB; color: #111827; font-size: 13px; font-weight: 600">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"></rect><path d="M11 18h2"></path></svg>
+          <span>Written on this iPhone</span>
+        </span>
+        <span style="display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; background: #EAEFF8; color: #283962; font-size: 13px; font-weight: 700">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg>
+          <span>Draft</span>
+        </span>
+      </div>
+    </header>
+
+    <div style="display: flex; gap: 12px; padding: 14px; border-radius: 14px; background: #EBF0F8; border: 1px solid #D7DFEC">
+      <span aria-hidden="true" style="width: 30px; height: 30px; flex-shrink: 0; border-radius: 8px; background: #283962; display: flex; align-items: center; justify-content: center">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FCFBF8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg>
+      </span>
+      <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0">
+        <p style="margin: 0; font-size: 16px; font-weight: 700; color: #1A2C52">Review your draft</p>
+        <p style="margin: 0; font-size: 14px; line-height: 1.45; color: #33415C">Edit anything, or rewrite it from a template. <strong>Save notes</strong> keeps only your notes and clears the transcript.</p>
+      </div>
+    </div>
+
+    <section style="display: flex; flex-direction: column; gap: 8px">
+      <h2 style="margin: 0; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #6C6660">Summary</h2>
+      <p style="margin: 0; font-size: 17px; line-height: 1.5">[A short paragraph summarising what the meeting covered, written by the notes model from the session.]</p>
+    </section>
+
+    <section style="display: flex; flex-direction: column; gap: 8px">
+      <h2 style="margin: 0; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #6C6660">Decisions</h2>
+      <ul style="margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; font-size: 17px; line-height: 1.45">
+        <li>[Decision one]</li>
+        <li>[Decision two]</li>
+      </ul>
+    </section>
+
+    <section style="display: flex; flex-direction: column; gap: 4px">
+      <h2 style="margin: 0 0 4px; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #6C6660">Action items</h2>
+      <label style="min-height: 44px; display: flex; align-items: center; gap: 12px; font-size: 17px; cursor: pointer">
+        <input type="checkbox" style="width: 20px; height: 20px; accent-color: #283962; flex-shrink: 0">
+        <span>[Action item] — [Owner]</span>
+      </label>
+      <label style="min-height: 44px; display: flex; align-items: center; gap: 12px; font-size: 17px; cursor: pointer">
+        <input type="checkbox" style="width: 20px; height: 20px; accent-color: #283962; flex-shrink: 0">
+        <span>[Action item] — [Owner]</span>
+      </label>
+    </section>
+  </article>
+
+  <div style="flex-shrink: 0; padding: 12px 20px 34px; border-top: 1px solid #E4DFD8; background: rgba(255,255,255,0.94); display: flex; gap: 10px">
+    <a href="Template.dc.html" style="flex: 1 1 0; height: 50px; border-radius: 14px; border: 1px solid #E4DFD8; background: #FFFFFF; color: #111827; font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; text-decoration: none">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#283962" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"></path><circle cx="16" cy="6" r="2"></circle><circle cx="10" cy="12" r="2"></circle><circle cx="18" cy="18" r="2"></circle></svg>
+      <span>Edit template</span>
+    </a>
+    <button type="button" style="flex: 1 1 0; height: 50px; border: 0; border-radius: 14px; background: #283962; color: #FCFBF8; font-family: inherit; font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>
+      <span>Save notes</span>
+    </button>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

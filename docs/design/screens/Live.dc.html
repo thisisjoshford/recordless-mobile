@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live session</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&amp;family=Source+Sans+3:wght@400;600;700&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#283962}a:hover{color:#1B2D55}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #FBFAF7; color: #111827; font-family: 'Source Sans 3', -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; padding: 54px 20px 40px; gap: 16px">
+  <div style="display: flex; justify-content: center">
+    <svg width="72" height="72" viewBox="0 0 500 500" role="img" aria-label="Recordless"><rect x="50" y="50" width="400" height="400" rx="94" fill="#F9F8F5"></rect><rect x="50.5" y="50.5" width="399" height="399" rx="93.5" fill="none" stroke="#E4DFD8" stroke-width="2"></rect><path d="M112 170V124a12 12 0 0 1 12-12H170M330 112H376a12 12 0 0 1 12 12V170M388 330V376a12 12 0 0 1-12 12H330M170 388H124a12 12 0 0 1-12-12V330" fill="none" stroke="#223868" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"></path><circle cx="250" cy="250" r="72" fill="#E5362F"></circle><line x1="188" y1="312" x2="312" y2="188" stroke="#223868" stroke-width="26" stroke-linecap="round"></line></svg>
+  </div>
+  <header style="display: flex; align-items: center; justify-content: space-between; gap: 12px">
+    <h1 style="margin: 0; font-size: 56px; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -1px">12:48</h1>
+    <span role="status" style="display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: #EAEFF8; color: #283962; font-size: 15px; font-weight: 700; white-space: nowrap">
+      <sc-if value="{{isListening}}" hint-placeholder-val="{{ true }}">
+        <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><rect x="0" y="5" width="3" height="4" rx="1.5" fill="#283962"></rect><rect x="5" y="2" width="3" height="10" rx="1.5" fill="#283962"></rect><rect x="10" y="0" width="3" height="14" rx="1.5" fill="#283962"></rect><rect x="15" y="4" width="3" height="6" rx="1.5" fill="#283962"></rect></svg>
+      </sc-if>
+      <sc-if value="{{isTranscribing}}" hint-placeholder-val="{{ false }}">
+        <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden="true"><rect x="0" y="6" width="5" height="2.5" rx="1.25" fill="#283962"></rect><rect x="6.5" y="6" width="5" height="2.5" rx="1.25" fill="#283962" opacity="0.6"></rect><rect x="13" y="6" width="5" height="2.5" rx="1.25" fill="#283962" opacity="0.3"></rect></svg>
+      </sc-if>
+      <span>{{statusLabel}}</span>
+    </span>
+  </header>
+
+  <div role="group" aria-label="Microphone level" style="display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border-radius: 12px; border: 1px solid #E4DFD8; background: #FFFFFF">
+    <span style="display: flex; align-items: center; gap: 8px; font-size: 14px">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#111827" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg>
+      <span style="flex-grow: 1; font-weight: 600">iPhone Microphone</span>
+      <span style="color: {{levelColor}}; font-weight: 700">{{levelLabel}}</span>
+    </span>
+    <span aria-hidden="true" style="display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 3px">
+      <sc-for list="{{segs}}" as="s" hint-placeholder-count="16"><span style="display: block; height: 10px; border-radius: 2px; background: {{s}}"></span></sc-for>
+    </span>
+  </div>
+
+  <section aria-labelledby="captured" style="flex-grow: 1; min-height: 0; display: flex; flex-direction: column; background: #FFFFFF; border: 1px solid #E4DFD8; border-radius: 16px; box-shadow: 0 1px 2px rgba(17,24,39,0.05); overflow: hidden">
+    <div style="padding: 16px 18px 12px; border-bottom: 1px solid #E4DFD8; display: flex; flex-direction: column; gap: 6px">
+      <div style="display: flex; align-items: baseline; justify-content: space-between">
+        <h2 id="captured" style="margin: 0; font-size: 16px; font-weight: 700; color: #283962">Captured</h2>
+        <span style="font-size: 14px; font-weight: 600; color: #111827; font-variant-numeric: tabular-nums">{{wordCount}} words</span>
+      </div>
+      <p style="margin: 0; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #6C6660">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#111827" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"></rect><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"></path></svg>
+        <span><strong style="color: #111827">In memory only</strong> — never written to disk</span>
+      </p>
+    </div>
+    <div aria-hidden="true" style="flex-grow: 1; padding: 16px 18px; display: flex; flex-direction: column; justify-content: flex-end; gap: 9px; overflow: hidden">
+      <sc-for list="{{lines}}" as="line" hint-placeholder-count="10">
+        <div style="display: flex; flex-wrap: nowrap; gap: 5px; opacity: {{line.opacity}}; margin-top: {{line.gap}}">
+          <sc-for list="{{line.words}}" as="w" hint-placeholder-count="6">
+            <span style="display: block; height: 10px; border-radius: 3px; background: #283962; width: {{w}}px"></span>
+          </sc-for>
+        </div>
+      </sc-for>
+    </div>
+    <p style="margin: 0; padding: 10px 18px 14px; font-size: 12px; color: #6C6660; border-top: 1px solid #E4DFD8">Words are counted, never shown. The transcript clears when you generate notes or discard.</p>
+  </section>
+
+  <div style="display: flex; align-items: center; gap: 12px">
+    <button type="button" aria-label="Pause" style="width: 54px; height: 54px; flex-shrink: 0; border-radius: 999px; border: 1px solid #E4DFD8; background: #FFFFFF; display: flex; align-items: center; justify-content: center; cursor: pointer">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="#283962" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"></rect><rect x="14" y="5" width="4" height="14" rx="1"></rect></svg>
+    </button>
+    <a href="Generate.dc.html" style="flex-grow: 1; height: 54px; border-radius: 14px; background: #283962; color: #FCFBF8; font-size: 17px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; text-decoration: none">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5"></rect></svg>
+      <span>End session</span>
+    </a>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"status":{"editor":"enum","options":["listening","transcribing"],"default":"listening"},"level":{"editor":"enum","options":["quiet","good","hot"],"default":"good"},"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    var states = {
+      quiet: { filled: 3, label: 'Too quiet', text: '#935610' },
+      good: { filled: 10, label: 'Good level', text: '#2F8A62' },
+      hot: { filled: 15, label: 'Too loud', text: '#A84A0A' }
+    };
+    var st = states[this.props.level] || states.good;
+    var segs = [];
+    for (var s = 0; s < 16; s++) {
+      var zone = s < 12 ? ['#2F8A62', '#E9F4EE'] : s < 14 ? ['#DC9418', '#FBF4E7'] : ['#E56106', '#FCE9DC'];
+      segs.push(s < st.filled ? zone[0] : zone[1]);
+    }
+    var seed = 7;
+    function rnd() { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; }
+    var rows = 14;
+    var lines = [];
+    for (var i = 0; i < rows; i++) {
+      var words = [];
+      var used = 0;
+      var max = (i % 4 === 3) ? 150 : 300;
+      while (true) {
+        var w = 14 + Math.round(rnd() * 46);
+        if (used + w + 5 > max) break;
+        words.push(w);
+        used += w + 5;
+      }
+      var age = rows - 1 - i;
+      var opacity = age < 2 ? 0.72 : age < 4 ? 0.5 : age < 7 ? 0.32 : 0.2;
+      lines.push({ words: words, opacity: opacity, gap: (i > 0 && i % 4 === 0) ? '8px' : '0' });
+    }
+    return { lines: lines, wordCount: '1,284', segs: segs, levelLabel: st.label, levelColor: st.text, isListening: this.props.status !== 'transcribing', isTranscribing: this.props.status === 'transcribing', statusLabel: this.props.status === 'transcribing' ? 'Transcribing…' : 'Listening…' };
+  }
+}
+</script>
+</body>
+</html>

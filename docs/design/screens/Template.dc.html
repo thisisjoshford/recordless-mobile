@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Edit template</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&amp;family=Source+Sans+3:wght@400;600;700&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#283962}a:hover{color:#1B2D55}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; background: #4A4F5C; color: #111827; font-family: 'Source Sans 3', -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; justify-content: flex-end; padding-top: 56px">
+  <section role="dialog" aria-labelledby="tpl-title" style="background: #FBFAF7; border-radius: 22px 22px 0 0; padding: 8px 20px 34px; display: flex; flex-direction: column; gap: 16px">
+    <span aria-hidden="true" style="align-self: center; width: 40px; height: 5px; border-radius: 999px; background: #E4DFD8"></span>
+
+    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px">
+      <a href="Note.dc.html" style="min-height: 44px; display: flex; align-items: center; font-size: 17px; text-decoration: none">Cancel</a>
+      <h1 id="tpl-title" style="margin: 0; font-size: 17px; font-weight: 700">Edit template</h1>
+      <span aria-hidden="true" style="width: 52px"></span>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 8px">
+      <label for="tpl" style="font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #6C6660">Template</label>
+      <textarea id="tpl" rows="4" style="box-sizing: border-box; width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid #E4DFD8; background: #FFFFFF; font-family: inherit; font-size: 17px; line-height: 1.45; color: #111827; resize: none">Summarize the discussion, the decisions and agreements, open questions, and next steps. Put next steps and owners at the top.</textarea>
+      <div style="display: flex; flex-wrap: wrap; gap: 8px">
+        <button type="button" style="min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid #E4DFD8; background: #FFFFFF; font-family: inherit; font-size: 14px; font-weight: 600; color: #283962; cursor: pointer">+ More detail</button>
+        <button type="button" style="min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid #E4DFD8; background: #FFFFFF; font-family: inherit; font-size: 14px; font-weight: 600; color: #283962; cursor: pointer">+ Bullets only</button>
+        <button type="button" disabled style="min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid #D7DFEC; background: #EBF0F8; font-family: inherit; font-size: 14px; font-weight: 600; color: #283962">✓ Action items first</button>
+      </div>
+    </div>
+
+    <fieldset style="margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: 8px">
+      <legend style="padding: 0 0 8px; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #6C6660">Rewrite on</legend>
+      <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; border-radius: 12px; background: #F4F1EB">
+        <label style="min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 6px; border-radius: 9px; background: #FFFFFF; box-shadow: 0 1px 2px rgba(17,24,39,0.08); font-size: 15px; font-weight: 700; cursor: pointer">
+          <input type="radio" name="dest" checked style="position: absolute; opacity: 0; width: 1px; height: 1px">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#283962" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"></rect><path d="M11 18h2"></path></svg>
+          <span>This iPhone</span>
+        </label>
+        <label style="min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 6px; border-radius: 9px; font-size: 15px; font-weight: 600; color: #6C6660; cursor: pointer">
+          <input type="radio" name="dest" style="position: absolute; opacity: 0; width: 1px; height: 1px">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 1 0 6 17.7"></path><path d="M6 19h11.5"></path></svg>
+          <span>Private cloud</span>
+        </label>
+      </div>
+    </fieldset>
+
+    <label style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 14px; background: #FFFFFF; border: 1px solid #E4DFD8; cursor: pointer">
+      <span style="display: flex; flex-direction: column; gap: 2px">
+        <span style="font-size: 16px; font-weight: 600">Scrub personal info</span>
+        <span style="font-size: 13px; color: #6C6660">Names, emails, phone numbers, links, IDs</span>
+      </span>
+      <input type="checkbox" role="switch" checked style="width: 44px; height: 26px; accent-color: #283962; flex-shrink: 0">
+    </label>
+
+    <div style="display: flex; flex-direction: column; gap: 8px">
+      <a href="Note.dc.html" style="height: 54px; border-radius: 14px; background: #283962; color: #FCFBF8; font-size: 17px; font-weight: 700; display: flex; align-items: center; justify-content: center; text-decoration: none">Rewrite notes</a>
+      <p style="margin: 0; font-size: 13px; line-height: 1.45; color: #6C6660; text-align: center">The draft is rewritten from this template. The transcript stays in memory until you save.</p>
+    </div>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

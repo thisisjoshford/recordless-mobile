@@ -20,22 +20,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 struct RecordlessApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @State private var app = AppModel()
+    @State private var app: AppModel
+    @State private var flow: AppFlow
+
+    init() {
+        let app = AppModel()
+        _app = State(initialValue: app)
+        _flow = State(initialValue: AppFlow(app: app))
+    }
 
     var body: some Scene {
         WindowGroup {
             RootView()
+                .environment(flow)
                 .environment(app)
                 .environment(app.models)
                 .environment(app.recorder)
                 .environment(app.vault)
                 .environment(app.generator)
-                .overlay {
-                    // Hide content in the app-switcher snapshot and whenever we are not frontmost.
-                    if scenePhase != .active { PrivacyOverlay() }
-                }
                 #if DEBUG
-                .task { SelfTest.runIfRequested(app) }
+                .task { SelfTest.runIfRequested(app); flow.applyDebugScreen() }
                 #endif
         }
         .onChange(of: scenePhase) { _, phase in
@@ -44,6 +48,13 @@ struct RecordlessApp: App {
             // request or an unsaved transcript. AppModel retries the lock
             // whenever such work ends while the app is still in the background.
             app.scenePhaseChanged(background: phase == .background)
+            flow.scenePhaseChanged(phase)
+            // Hide content (sheets and covers too) in the app-switcher
+            // snapshot and whenever we are not frontmost.
+            PrivacyShield.setVisible(phase != .active)
+            if phase == .active {
+                ActivityMonitor.install { [flow] in flow.noteActivity() }
+            }
         }
     }
 }

@@ -5,7 +5,9 @@
 # (project.yml). Usage: make-selftest-fixture.sh <out.wav>
 set -euo pipefail
 out="$1"
-tmp="$(dirname "$out")/selftest-$$.aiff"
+# Xcode's script sandbox only allows writes to declared outputs, so when
+# building the intermediate is the declared $DERIVED_FILE_DIR/selftest.aiff.
+if [ -n "${DERIVED_FILE_DIR:-}" ]; then tmp="$DERIVED_FILE_DIR/selftest.aiff"; mkdir -p "$DERIVED_FILE_DIR"; else tmp="${TMPDIR:-/tmp}/selftest-$$.aiff"; fi
 mkdir -p "$(dirname "$out")"
 # [[slnc N]] inserts N ms of silence so the VAD sees separate utterances.
 text='Good morning everyone, thanks for joining the weekly planning meeting. [[slnc 1200]]
