@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import Observation
+import os
 
 /// Drives one meeting: Session lifecycle + AudioCapture + ~1 Hz progress polling.
 /// Only counts and timings are surfaced. Transcript text never reaches Swift.
@@ -37,6 +38,13 @@ final class Recorder {
     /// The stopped session, handed to NotesGenerator. Cleared on discard.
     private(set) var session: Session?
 
+    /// Paused: audio is dropped in memory before it reaches the core.
+    private(set) var paused = false
+    private(set) var pausedAt: Date?
+    /// Paused time so far, excluded from `elapsed`.
+    private(set) var pausedTotal: TimeInterval = 0
+    private let pauseGate = OSAllocatedUnfairLock(initialState: false)
+
     private let capture = AudioCapture()
     private var pollTask: Task<Void, Never>?
     /// Bumped by `discard()`. `start()`/`stop()` capture it before each await
@@ -50,9 +58,35 @@ final class Recorder {
 
     var isCapturing: Bool { phase == .recording || phase == .loadingModel || phase == .stopping }
 
-    var elapsed: TimeInterval {
+    var elapsed: TimeInterval { elapsed(at: Date()) }
+
+    /// Listening time, without paused time.
+    func elapsed(at now: Date) -> TimeInterval {
         guard let startedAt else { return 0 }
-        return (stoppedAt ?? Date()).timeIntervalSince(startedAt)
+        let end = stoppedAt ?? pausedAt ?? now
+        return max(0, end.timeIntervalSince(startedAt) - pausedTotal)
+    }
+
+    func pause() {
+        guard phase == .recording, !paused else { return }
+        pauseGate.withLock { $0 = true }
+        paused = true
+        pausedAt = Date()
+    }
+
+    func resume() {
+        guard phase == .recording, paused, let pausedAt else { return }
+        pauseGate.withLock { $0 = false }
+        pausedTotal += Date().timeIntervalSince(pausedAt)
+        self.pausedAt = nil
+        paused = false
+    }
+
+    private func resetPause() {
+        pauseGate.withLock { $0 = false }
+        paused = false
+        pausedAt = nil
+        pausedTotal = 0
     }
 
     init() {
@@ -116,8 +150,11 @@ final class Recorder {
         captureStats = nil
         pushErrors = 0
 
+        resetPause()
+        let gate = pauseGate
         do {
             try capture.start { [weak self] samples in
+                if gate.withLock({ $0 }) { return }     // paused: dropped, never stored
                 do {
                     try session.pushAudio(samples: samples)
                 } catch {
@@ -146,6 +183,9 @@ final class Recorder {
         guard phase == .recording, let session else { return }
         let gen = generation
         phase = .stopping
+        if let pausedAt { pausedTotal += Date().timeIntervalSince(pausedAt) }
+        pausedAt = nil
+        paused = false
         stoppedAt = Date()
         capture.stop()          // drains queued pushes
         pollTask?.cancel()
@@ -197,6 +237,7 @@ final class Recorder {
         stoppedAt = nil
         interrupted = false
         level = 0
+        resetPause()
         phase = .idle
         onWorkFinished?()
     }

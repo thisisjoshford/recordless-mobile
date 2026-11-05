@@ -15,6 +15,7 @@ struct RootView: View {
         }
         .tint(Theme.primary)
         .animation(.easeOut(duration: 0.2), value: flow.locked)
+        .onChange(of: flow.app.vault.state) { flow.vaultStateChanged() }
     }
 }
 

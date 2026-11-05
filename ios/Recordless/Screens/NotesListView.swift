@@ -23,6 +23,11 @@ struct NotesListView: View {
                         .font(Theme.font(Theme.Size.meta, relativeTo: .footnote))
                         .foregroundStyle(Theme.mutedForeground)
                 }
+                if let error = flow.library.loadError {
+                    Text(error)
+                        .font(Theme.font(Theme.Size.secondary, .semibold))
+                        .foregroundStyle(Theme.destructive)
+                }
                 if groups.isEmpty {
                     Text(query.isEmpty ? "No notes yet." : "No matching notes.")
                         .font(Theme.font(Theme.Size.row))
@@ -112,7 +117,7 @@ private struct NoteRow: View {
             Spacer(minLength: 0)
             switch note.state {
             case .writing: ProgressRing(size: 18)
-            case .queued: StatusTag(text: "Queued", kind: .queued, compact: true)
+            case .failed: StatusTag(text: "Not written", kind: .draft, compact: true)
             case .draft: StatusTag(text: "Draft", kind: .draft, compact: true)
             case .saved: EmptyView()
             }
@@ -174,12 +179,12 @@ enum NoteGrouping {
     /// "Oct 10 · 2:00 PM · 38 min" older.
     static func rowMeta(_ note: NoteItem) -> String {
         let time = note.createdAt.formatted(date: .omitted, time: .shortened)
-        let dur = DurationFormat.minutes(note.duration)
-        if Calendar.current.isDateInToday(note.createdAt) { return "\(time) · \(dur)" }
+        let dur = note.duration > 0 ? " · \(DurationFormat.minutes(note.duration))" : ""
+        if Calendar.current.isDateInToday(note.createdAt) { return "\(time)\(dur)" }
         let day = isEarlierThisWeek(note.createdAt)
             ? note.createdAt.formatted(.dateTime.weekday(.abbreviated))
             : note.createdAt.formatted(.dateTime.month(.abbreviated).day())
-        return "\(day) · \(time) · \(dur)"
+        return "\(day) · \(time)\(dur)"
     }
 
     /// "Today · 2:30 PM · 32 min".

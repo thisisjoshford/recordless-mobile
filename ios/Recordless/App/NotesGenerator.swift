@@ -161,11 +161,12 @@ final class NotesGenerator {
     // MARK: Generate
 
     /// Private cloud notes.
-    func generate(session: Session, vault: Vault) async {
+    /// `instructions`: the person's style request from Edit template, if any.
+    func generate(session: Session, vault: Vault, instructions: String? = nil) async {
         let scrub = self.scrub
         let modelID = effectiveModel?.id ?? selectedModelID
         await run(session: session, taskName: "Private cloud notes") {
-            try session.generateNotes(vault: vault, modelId: modelID, scrub: scrub)
+            try session.generateNotes(vault: vault, modelId: modelID, scrub: scrub, instructions: instructions)
         }
         // A rejected key is recorded as used-up credit by the core.
         if result == nil { await refreshCredit(vault: vault) }
@@ -174,14 +175,14 @@ final class NotesGenerator {
     /// On-device notes with the GGUF at `model`. The screen is kept awake
     /// while it runs: the background time iOS grants is short, and it refuses
     /// GPU work there (the core then moves a GPU run to the CPU).
-    func generateOnDevice(session: Session, model: URL, useGpu: Bool) async {
+    func generateOnDevice(session: Session, model: URL, useGpu: Bool, instructions: String? = nil) async {
         let scrub = self.scrub
         let path = model.path
         let idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
         defer { UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled }
         await run(session: session, taskName: "On-device notes") {
-            try session.generateNotesOnDevice(modelPath: path, useGpu: useGpu, scrub: scrub)
+            try session.generateNotesOnDevice(modelPath: path, useGpu: useGpu, scrub: scrub, instructions: instructions)
         }
     }
 

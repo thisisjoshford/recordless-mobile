@@ -1,20 +1,24 @@
 import SwiftUI
 
 /// SPEC 6, `Template.dc.html`. Only offered while the draft's transcript is
-/// still in memory.
+/// still in memory. The template goes to the notes model as style
+/// instructions; it can't override the privacy rules.
 struct EditTemplateSheet: View {
     @Environment(AppFlow.self) private var flow
     @Environment(\.dismiss) private var dismiss
     let noteID: UUID
 
-    @State private var template = NotesLibrary.defaultTemplate
+    @State private var template = Self.defaultTemplate
     @State private var destination: NotesDestination
     @State private var scrub = ScrubSetting()
 
-    init(noteID: UUID, destination: NotesDestination) {
+    init(noteID: UUID, destination: NotesDestination?) {
         self.noteID = noteID
-        _destination = State(initialValue: destination)
+        _destination = State(initialValue: destination ?? .onDevice)
     }
+
+    static let defaultTemplate =
+        "Summarize the discussion, the decisions and agreements, open questions, and next steps."
 
     private static let quickAdds: [(title: String, sentence: String)] = [
         ("More detail", "Be more detailed."),
@@ -82,7 +86,14 @@ struct EditTemplateSheet: View {
                     dismiss()
                 }
                 .disabled(template.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                          || destination == .privateCloud && !Self.privateCloudAvailable)
+                          || blocker != nil)
+                if let blocker {
+                    Text(blocker)
+                        .font(Theme.font(Theme.Size.meta, .semibold, relativeTo: .footnote))
+                        .foregroundStyle(Theme.mutedForeground)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                }
                 Text("The draft is rewritten from this template. The transcript stays in memory until you save.")
                     .font(Theme.font(Theme.Size.meta, relativeTo: .footnote))
                     .foregroundStyle(Theme.mutedForeground)
@@ -92,15 +103,23 @@ struct EditTemplateSheet: View {
         }
         .fittedSheet()
         .scrubConfirmation(scrub: $scrub)
+        .task(id: destination) {
+            if destination == .privateCloud { await flow.library.refreshCloud() }
+        }
     }
 
-    /// Private cloud rewrites need the attestation check (Milestone 7).
-    /// Debug builds allow the mock; Release refuses.
-    #if DEBUG
-    private static let privateCloudAvailable = true
-    #else
-    private static let privateCloudAvailable = false
-    #endif
+    /// Why Rewrite is disabled for the chosen destination, or nil.
+    private var blocker: String? {
+        switch destination {
+        case .onDevice: return flow.library.onDeviceBlocker
+        case .privateCloud:
+            switch flow.library.cloudReadiness {
+            case .ready: return nil
+            case .checking: return "Checking the private cloud…"
+            case .unavailable(let reason): return reason
+            }
+        }
+    }
 
     private func append(_ sentence: String) {
         let trimmed = template.trimmingCharacters(in: .whitespacesAndNewlines)

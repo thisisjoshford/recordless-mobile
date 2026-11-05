@@ -51,18 +51,27 @@ struct HomeView: View {
             Button("Discard and lock", role: .destructive) { flow.lock(force: true) }
             Button("Keep working", role: .cancel) {}
         } message: { Text($0) }
-        .alert(startBlocker == .writing ? "Notes are being written" : "Start a new session?",
-               isPresented: isPresent($startBlocker), presenting: startBlocker) { blocker in
+        .alert(Self.title(startBlocker), isPresented: isPresent($startBlocker), presenting: startBlocker) { blocker in
             if blocker == .unsavedDraft {
-                Button("Start listening", role: .destructive) { flow.startListening() }
+                Button("Discard and start", role: .destructive) { flow.startListening() }
                 Button("Cancel", role: .cancel) {}
             } else {
                 Button("OK", role: .cancel) {}
             }
         } message: { blocker in
-            Text(blocker == .writing
-                 ? "Wait for the notes to finish before starting a new session."
-                 : "Your unsaved draft keeps its notes, but its transcript is cleared, so it can't be rewritten from a template.")
+            switch blocker {
+            case .writing: Text("Wait for the notes to finish before starting a new session.")
+            case .unsavedDraft: Text("Your last session's notes aren't saved. Starting a new session discards them and their transcript.")
+            case .noSpeechModel(let reason): Text(reason)
+            }
+        }
+    }
+
+    private static func title(_ blocker: AppFlow.StartBlocker?) -> String {
+        switch blocker {
+        case .writing: "Notes are being written"
+        case .noSpeechModel: "Speech model needed"
+        default: "Start a new session?"
         }
     }
 
@@ -161,12 +170,12 @@ private struct TodayCard: View {
             case .writing:
                 HStack(spacing: 8) {
                     ProgressRing()
-                    Text(note.writtenOn == .onDevice ? "Writing notes on this iPhone…" : "Writing notes in the private cloud…")
+                    Text(note.writtenOn == .privateCloud ? "Writing notes in the private cloud…" : "Writing notes on this iPhone…")
                 }
                 .font(Theme.font(Theme.Size.secondary, .semibold))
                 .foregroundStyle(Theme.info)
-            case .queued:
-                StatusTag(text: "Queued", kind: .queued, compact: true)
+            case .failed:
+                StatusTag(text: "Notes weren't written", kind: .draft, systemImage: "exclamationmark.circle", compact: true)
             case .draft, .saved:
                 if !note.firstSummaryLine.isEmpty {
                     Text(note.firstSummaryLine).font(Theme.font(Theme.Size.secondary))
@@ -185,7 +194,7 @@ private struct TodayCard: View {
         .padding(.vertical, 14)
         .cardStyle()
 
-        if note.state == .writing || note.state == .queued {
+        if note.state == .writing {
             content.accessibilityElement(children: .combine)
         } else {
             Button { flow.open(note.id, from: .listen) } label: { content }
