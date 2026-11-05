@@ -96,6 +96,7 @@ pub(crate) struct LocalRun<'a> {
     pub model_path: &'a str,
     pub use_gpu: bool,
     pub scrub: ScrubOptions,
+    pub instructions: Option<String>,
     pub status: Arc<Mutex<LiveStatus>>,
     pub cancel: &'a AtomicBool,
 }
@@ -227,7 +228,7 @@ impl LocalRun<'_> {
         let ctx = CONTEXT_TOKENS as usize;
         // What the final request's transcript (or combined summary) may use.
         let final_overhead = {
-            let empty = build_notes_prompt("", &self.scrub);
+            let empty = build_notes_prompt("", &self.scrub, self.instructions.as_deref());
             self.tokens(loaded, &empty.system) + self.tokens(loaded, &empty.user)
         };
         let final_budget = ctx - FINAL_OUTPUT_TOKENS - TEMPLATE_SLACK_TOKENS - final_overhead;
@@ -294,7 +295,7 @@ impl LocalRun<'_> {
             summaries.pop().expect("at least one chunk")
         };
 
-        let final_prompt = build_notes_prompt(&content, &self.scrub);
+        let final_prompt = build_notes_prompt(&content, &self.scrub, self.instructions.as_deref());
         drop(content);
         let requests = { self.status.lock().map(|s| s.requests).unwrap_or(0) }.max(totals.requests + 1);
         self.set_step("Writing notes on this device", totals.requests + 1, requests);
