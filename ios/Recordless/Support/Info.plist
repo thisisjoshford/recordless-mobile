@@ -25,9 +25,16 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Use Face ID to unlock your notebook.</string>
+	<string>Unlock your encrypted notebook.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Recordless listens to your meeting to write notes on this device. Audio stays in memory and is never saved or sent anywhere.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>SourceSans3-Regular.ttf</string>
+		<string>SourceSans3-SemiBold.ttf</string>
+		<string>SourceSans3-Bold.ttf</string>
+		<string>InstrumentSerif-Regular.ttf</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
