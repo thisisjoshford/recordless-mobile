@@ -31,6 +31,10 @@ final class AppFlow {
     /// A paused session left untouched this long is discarded and the
     /// notebook locks, so a forgotten pause can't hold it open.
     static let pausedSessionCap: TimeInterval = 15 * 60
+    /// Unsaved notes left untouched this long are discarded with the
+    /// transcript and the notebook locks, so a forgotten draft can't hold it
+    /// open either.
+    static let unsavedNotesCap: TimeInterval = 15 * 60
     /// Shown on the Unlock screen after an automatic discard.
     private(set) var lockNotice: String?
     @ObservationIgnored private var lastActivity = Date()
@@ -88,7 +92,7 @@ final class AppFlow {
     /// still in memory.
     func canRewrite(_ id: UUID) -> Bool {
         transcriptNoteID == id && session.hasTranscript && library.sessionBlocker == nil
-            && library.note(id)?.state == .draft && !library.isWriting
+            && library.note(id)?.state == .draft && !library.isWriting && !library.isSaving(id)
     }
 
     /// Rewrites the draft with the template's instructions.
@@ -118,10 +122,21 @@ final class AppFlow {
         if library.isWriting {
             return "Notes are being written. Wait for them to finish before locking the notebook."
         }
-        if transcriptNoteID != nil || session.hasTranscript || library.notes.contains(where: { $0.state != .saved }) {
+        if library.isSaving {
+            return "Notes are being saved. Wait for the save to finish before locking the notebook."
+        }
+        if hasUnsavedWork {
             return "This session's notes aren't saved yet. Locking clears them and the transcript."
         }
-        return app.unfinishedWork?.lockRefusal
+        return nil
+    }
+
+    /// Unsaved notes, or a transcript notes can still be written from. A
+    /// session that captured no speech or failed to stop has nothing to keep,
+    /// so it doesn't hold the notebook open.
+    private var hasUnsavedWork: Bool {
+        library.notes.contains { $0.state != .saved }
+            || (session.hasTranscript && library.sessionBlocker == nil)
     }
 
     /// Lock button and automatic locks. Without `force`, refused (returning
@@ -132,7 +147,9 @@ final class AppFlow {
     func lock(force: Bool = false) -> String? {
         if !force, let blocker = lockBlocker { return blocker }
         library.cancelWriting()
-        if force {
+        // Not blocked but a transcript is held: it has nothing worth keeping
+        // (no speech, or the stop failed), so wipe it with the lock.
+        if force || session.hasTranscript {
             app.discardSessionAndLock()
         } else if let refusal = app.lock() {
             return refusal.lockRefusal
@@ -157,7 +174,7 @@ final class AppFlow {
         if phase == .active {
             // Before touches count as activity: the cap may have passed
             // while the app was suspended.
-            enforcePausedCap()
+            enforceCaps()
             noteActivity()
         }
         retryAutomaticLock()
@@ -174,7 +191,7 @@ final class AppFlow {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
                 guard let self, !self.locked else { return }
-                self.enforcePausedCap()
+                self.enforceCaps()
                 guard !self.locked else { return }
                 // Refused while work is unfinished; checked again next tick.
                 if Date().timeIntervalSince(self.lastActivity) >= Self.idleLockAfter {
@@ -184,11 +201,20 @@ final class AppFlow {
         }
     }
 
-    private func enforcePausedCap(now: Date = Date()) {
-        guard !locked, let since = session.pausedSince else { return }
-        if now.timeIntervalSince(max(since, lastActivity)) >= Self.pausedSessionCap {
+    /// Discards a forgotten paused session or unsaved notes and locks.
+    private func enforceCaps(now: Date = Date()) {
+        guard !locked else { return }
+        if let since = session.pausedSince {
+            if now.timeIntervalSince(max(since, lastActivity)) >= Self.pausedSessionCap {
+                lock(force: true)
+                lockNotice = "The paused session was discarded after 15 minutes. Its transcript was cleared."
+            }
+            return
+        }
+        guard !session.isActive, !library.isWriting, !library.isSaving, hasUnsavedWork else { return }
+        if now.timeIntervalSince(lastActivity) >= Self.unsavedNotesCap {
             lock(force: true)
-            lockNotice = "The paused session was discarded after 15 minutes. Its transcript was cleared."
+            lockNotice = "Unsaved notes were discarded after 15 minutes without activity. The transcript was cleared."
         }
     }
 
@@ -241,7 +267,10 @@ final class AppFlow {
 
     /// Clears the session and any unsaved draft.
     func discardSession() {
-        if let id = transcriptNoteID { library.discard(id) }
+        if let id = transcriptNoteID {
+            guard !library.isSaving(id) else { return }
+            library.discard(id)
+        }
         releaseTranscript()
         livePresented = false
         listenPath = []
@@ -271,12 +300,15 @@ final class AppFlow {
     /// Saves to the encrypted notebook, keeping only the notes and clearing
     /// the transcript. Returns an error message if the save failed.
     func save(_ note: NoteItem) async -> String? {
+        guard !library.isSaving(note.id) else { return nil }
         library.update(note)
         do {
-            try await library.save(note.id)
+            guard try await library.save(note.id) else { return nil }
         } catch {
             return "Couldn't save the notes: \(describe(error))"
         }
+        // Locked during the save: the notebook is closed and cleared already.
+        guard !locked else { return nil }
         if transcriptNoteID == note.id {
             app.recorder.session?.markNotesSaved()
             releaseTranscript()

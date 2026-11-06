@@ -153,8 +153,8 @@ final class Recorder {
         resetPause()
         let gate = pauseGate
         do {
-            try capture.start { [weak self] samples in
-                if gate.withLock({ $0 }) { return }     // paused: dropped, never stored
+            // Paused audio is dropped in the tap, at capture time, never stored.
+            try capture.start(isPaused: { gate.withLock { $0 } }) { [weak self] samples in
                 do {
                     try session.pushAudio(samples: samples)
                 } catch {
@@ -200,9 +200,9 @@ final class Recorder {
         case .success(let p): progress = p
         case .failure(let error):
             if case CoreError.MemoryLock = error {
-                stopFailure = "Protected memory failed while recording, so the transcript was discarded and notes can't be written from this meeting. Discard it and record again."
+                stopFailure = "Protected memory failed during the session, so the transcript was discarded and notes can't be written from it. Discard this session and start a new one."
             } else {
-                stopFailure = "Stopping the recording failed (\(describe(error))), so notes can't be written from this meeting. Discard it and record again."
+                stopFailure = "Ending the session failed (\(describe(error))), so notes can't be written from it. Discard this session and start a new one."
             }
             lastError = "stop(): \(describe(error))"
         }

@@ -52,6 +52,9 @@ final class AudioCapture: @unchecked Sendable {
                                              interleaved: false)!
     private var converter: AVAudioConverter?
     private var sink: Sink?
+    /// Checked at capture time, in the tap: audio captured while it returns
+    /// true is dropped before it is queued.
+    private var isPaused: (@Sendable () -> Bool)?
     private var wantsRunning = false
     /// Bumped by `start()`/`stop()`. A queued push delivers only if the epoch
     /// it was enqueued in is still current, so nothing reaches a session
@@ -70,7 +73,7 @@ final class AudioCapture: @unchecked Sendable {
 
     // MARK: Public
 
-    func start(sink: @escaping Sink) throws {
+    func start(isPaused: (@Sendable () -> Bool)? = nil, sink: @escaping Sink) throws {
         let session = AVAudioSession.sharedInstance()
         // .record keeps other audio from mixing in; measurement mode disables
         // AGC / voice processing so the ASR sees the raw signal.
@@ -81,6 +84,7 @@ final class AudioCapture: @unchecked Sendable {
 
         lock.withLock {
             self.sink = sink
+            self.isPaused = isPaused
             self.wantsRunning = true
             self.epoch &+= 1
             self._stats = CaptureStats()
@@ -93,6 +97,7 @@ final class AudioCapture: @unchecked Sendable {
         lock.withLock {
             wantsRunning = false
             sink = nil
+            isPaused = nil
             converter = nil
             epoch &+= 1     // invalidates pushes already queued
         }
@@ -181,6 +186,12 @@ final class AudioCapture: @unchecked Sendable {
         let samples = Array(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
         let rms = Self.rms(of: samples)
         _stats.levelDb = rms > 1e-5 ? Int((20 * log10(rms)).rounded()) : -100
+        // Paused: metered as silence, dropped here so nothing captured during
+        // a pause is queued for the session.
+        if isPaused?() == true {
+            emitLevelLocked(0)
+            return
+        }
         emitLevelLocked(Self.level(rms: rms))
 
         let queuedEpoch = epoch

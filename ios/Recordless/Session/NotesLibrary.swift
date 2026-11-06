@@ -87,6 +87,13 @@ final class NotesLibrary {
     /// Called when a notes run ends (finished, failed or cancelled).
     @ObservationIgnored var onWriteFinished: (() -> Void)?
     @ObservationIgnored private var writer: Task<Void, Never>?
+    /// Bumped by `clear()` (lock): a load or save still awaiting the vault
+    /// sees a stale value and drops what it read.
+    @ObservationIgnored private var generation = 0
+    /// Notes with a vault save in flight; they can't be discarded or rewritten.
+    private(set) var saving: Set<UUID> = []
+    var isSaving: Bool { !saving.isEmpty }
+    func isSaving(_ id: UUID) -> Bool { saving.contains(id) }
     /// The draft a rewrite replaces, restored if the rewrite fails or is
     /// cancelled.
     @ObservationIgnored private var beforeRewrite: NoteItem?
@@ -114,10 +121,14 @@ final class NotesLibrary {
     /// Reads every saved note (notes only, decrypted into memory) after unlock.
     func load() async {
         guard !memoryOnly else { return }
+        let gen = generation
+        // Locked while awaiting the vault: drop everything read so far.
+        func stale() -> Bool { gen != generation || vault.state != .unlocked }
         do {
             let list = try await vault.listNotes()
             var loaded: [NoteItem] = []
             for summary in list {
+                guard !stale() else { return }
                 let markdown = try await vault.readNote(id: summary.id)
                 let parsed = NoteMarkdown.parse(markdown)
                 loaded.append(NoteItem(
@@ -127,17 +138,21 @@ final class NotesLibrary {
                     duration: parsed.duration, state: .saved, writtenOn: parsed.writtenOn,
                     sections: parsed.sections))
             }
+            guard !stale() else { return }
             // Keep a draft that appeared while loading.
             notes = notes.filter { $0.state != .saved } + loaded
             loadError = nil
         } catch {
+            guard !stale() else { return }
             loadError = "Couldn't read the notebook: \(describe(error))"
         }
     }
 
     /// Drops every note from memory (lock).
     func clear() {
+        generation += 1
         cancelWriting()
+        saving = []
         notes = []
         loadError = nil
     }
@@ -225,8 +240,13 @@ final class NotesLibrary {
     private func write(_ id: UUID, on destination: NotesDestination, scrub: Bool, instructions: String? = nil) {
         writer = Task { [weak self] in
             guard let self else { return }
+            // The notes live in the draft only: whatever happens below
+            // (discarded, locked, failed), the generator's copy is dropped.
+            defer {
+                self.generator.clear()
+                self.onWriteFinished?()
+            }
             let failure = await self.runGenerator(on: destination, scrub: scrub, instructions: instructions)
-            defer { self.onWriteFinished?() }
             let previous = self.beforeRewrite
             self.beforeRewrite = nil
             // Discarded or locked meanwhile: the note is already gone.
@@ -243,7 +263,6 @@ final class NotesLibrary {
                 note.state = .failed
                 note.error = failure ?? self.generator.error ?? "Notes couldn't be written."
             }
-            self.generator.clear()      // the notes now live in the draft only
             self.update(note)
         }
     }
@@ -287,27 +306,35 @@ final class NotesLibrary {
 
     /// Removes an unsaved draft or failed note.
     func discard(_ id: UUID) {
-        guard let note = note(id), note.state != .saved else { return }
+        guard let note = note(id), note.state != .saved, !isSaving(id) else { return }
         if note.state == .writing { cancelWriting() }
         notes.removeAll { $0.id == id }
     }
 
     // MARK: Saving
 
-    /// Saves a draft to the encrypted notebook. Throws if the vault refuses.
-    func save(_ id: UUID) async throws {
-        guard var note = note(id), note.state == .draft else { return }
+    /// Saves a draft to the encrypted notebook. Throws if the vault refuses;
+    /// returns false if there was nothing to save or the notebook locked
+    /// meanwhile.
+    @discardableResult
+    func save(_ id: UUID) async throws -> Bool {
+        guard var note = note(id), note.state == .draft, !isSaving(id) else { return false }
         let title = note.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Session \(note.createdAt.formatted(date: .abbreviated, time: .shortened))"
             : note.title
         if memoryOnly {
             note.vaultID = UUID().uuidString
         } else {
+            let gen = generation
+            saving.insert(id)
+            defer { if gen == generation { saving.remove(id) } }
             note.vaultID = try await vault.saveNote(title: title, markdown: NoteMarkdown.render(note, metadata: true))
+            guard gen == generation else { return false }
         }
         note.title = title
         note.state = .saved
         update(note)
+        return true
     }
 
     #if DEBUG
@@ -341,62 +368,112 @@ enum NoteMarkdown {
     private static let metaPrefix = "<!-- recordless "
 
     static func parse(_ markdown: String) -> Parsed {
+        var p = Parser()
+        for raw in markdown.components(separatedBy: .newlines) { p.consume(raw) }
+        p.flush()
+        return p.out
+    }
+
+    private struct Parser {
         var out = Parsed()
         var current: NoteSection?
-        func flush() {
+        /// Items in an untitled continuation of an action section keep checkboxes.
+        var actionContext = false
+        /// The previous line was an item (no blank line since): an indented
+        /// line continues it.
+        var inItem = false
+        /// A blank line came since the last paragraph line.
+        var blank = false
+
+        mutating func flush() {
             if var s = current {
                 s.text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !s.title.isEmpty || !s.text.isEmpty || !s.items.isEmpty { out.sections.append(s) }
             }
             current = nil
+            blank = false
         }
 
-        for raw in markdown.components(separatedBy: .newlines) {
+        mutating func start(_ title: String, keepActionContext: Bool = false) {
+            flush()
+            current = NoteSection(title: title)
+            actionContext = keepActionContext ? actionContext : NoteSection.isActionSection(title)
+        }
+
+        mutating func consume(_ raw: String) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix(metaPrefix) {
                 parseMeta(line, into: &out)
-                continue
+                return
+            }
+            // A line the renderer escaped: literal paragraph text.
+            if line.hasPrefix("\\") {
+                text(String(line.dropFirst()))
+                return
             }
             if line.hasPrefix("# ") {
-                let t = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-                if out.title.isEmpty, !t.hasPrefix("<") { out.title = stripEmphasis(t) }
-                continue
+                inItem = false
+                let t = stripEmphasis(String(line.dropFirst(2)))
+                if out.title.isEmpty, current == nil, out.sections.isEmpty, !t.hasPrefix("<") {
+                    out.title = t
+                } else if !t.isEmpty {
+                    start(t)        // a later top-level heading is a section, not dropped
+                }
+                return
             }
             if let header = header(line) {
-                flush()
-                current = NoteSection(title: header)
-                continue
+                inItem = false
+                start(header)
+                return
             }
             if let (text, done) = item(line) {
-                if current == nil { current = NoteSection(title: "") }
-                let isAction = NoteSection.isActionSection(current!.title)
-                current!.items.append(.init(text: text, done: done ?? (isAction ? false : nil)))
-                continue
+                if current == nil { start("", keepActionContext: true) }
+                current!.items.append(.init(text: text, done: done ?? (actionContext ? false : nil)))
+                inItem = true
+                return
             }
             if line.isEmpty {
-                if current != nil, !current!.text.isEmpty, !current!.text.hasSuffix("\n\n") { current!.text += "\n" }
-                continue
+                inItem = false
+                blank = true
+                return
             }
-            if current == nil { current = NoteSection(title: "") }
-            if !current!.text.isEmpty, !current!.text.hasSuffix("\n") { current!.text += " " }
+            // Wrapped continuation of the item above.
+            if inItem, raw.first?.isWhitespace == true, let c = current, !c.items.isEmpty {
+                current!.items[c.items.count - 1].text += " " + line
+                return
+            }
+            text(line)
+        }
+
+        /// Paragraph text. Text after a section's items starts an untitled
+        /// continuation so it stays below them.
+        mutating func text(_ line: String) {
+            inItem = false
+            if current == nil || current!.items.isEmpty == false {
+                start("", keepActionContext: current != nil)
+            }
+            // Line breaks are kept, so edited text reads back as written.
+            if !current!.text.isEmpty { current!.text += blank ? "\n\n" : "\n" }
+            blank = false
             current!.text += line
         }
-        flush()
-        return out
     }
 
     static func render(_ note: NoteItem, metadata: Bool = false) -> String {
-        var out = "# \(note.displayTitle)\n\n"
+        var out = "# \(oneLine(note.displayTitle))\n\n"
         for section in note.sections {
-            if !section.title.isEmpty { out += "**\(section.title)**\n\n" }
+            if !section.title.isEmpty { out += "**\(oneLine(section.title))**\n\n" }
             let text = section.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { out += text + "\n\n" }
+            if !text.isEmpty {
+                out += text.components(separatedBy: .newlines).map(escaped).joined(separator: "\n") + "\n\n"
+            }
             if !section.items.isEmpty {
                 out += section.items.map { item in
-                    switch item.done {
-                    case .some(true): "- [x] \(item.text)"
-                    case .some(false): "- [ ] \(item.text)"
-                    case .none: "- \(item.text)"
+                    let text = oneLine(item.text)
+                    return switch item.done {
+                    case .some(true): "- [x] \(text)"
+                    case .some(false): "- [ ] \(text)"
+                    case .none: "- \(text)"
                     }
                 }.joined(separator: "\n") + "\n\n"
             }
@@ -407,6 +484,19 @@ enum NoteMarkdown {
             out += meta + " -->\n"
         }
         return out
+    }
+
+    /// A paragraph line that would read back as structure (item, heading,
+    /// metadata, escape) gets a leading backslash; `parse` strips it.
+    private static func escaped(_ line: String) -> String {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        let structural = t.hasPrefix("\\") || t.hasPrefix("#") || t.hasPrefix(metaPrefix)
+            || header(t) != nil || item(t) != nil
+        return structural ? "\\" + t : line
+    }
+
+    private static func oneLine(_ s: String) -> String {
+        s.components(separatedBy: .newlines).joined(separator: " ")
     }
 
     private static func parseMeta(_ line: String, into out: inout Parsed) {
@@ -426,6 +516,8 @@ enum NoteMarkdown {
         if line.hasPrefix("## ") || line.hasPrefix("### ") {
             return stripEmphasis(line.drop { $0 == "#" }.trimmingCharacters(in: .whitespaces))
         }
+        var line = line
+        if line.hasSuffix("**:") { line.removeLast() }     // "**Next Steps**:"
         if line.count > 4, line.hasPrefix("**"), line.hasSuffix("**") {
             let inner = String(line.dropFirst(2).dropLast(2))
             if !inner.contains("**") { return inner.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: ":")) }

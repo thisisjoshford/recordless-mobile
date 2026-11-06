@@ -100,6 +100,7 @@ struct NoteView: View {
                     } else {
                         SecondaryButton(title: "Discard", systemImage: "trash",
                                         height: Theme.Spacing.barButton) { confirmDiscard = true }
+                            .disabled(saving || flow.library.isSaving(noteID))
                     }
                     if isDraft {
                         PrimaryButton(title: saving ? "Saving…" : "Save notes", systemImage: "checkmark",
