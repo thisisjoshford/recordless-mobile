@@ -27,11 +27,13 @@ struct NoteView: View {
             get: { draft ?? note },
             set: { draft = $0 })
         let isDraft = note.state == .draft
+        // Locked while a save is in flight, so edits can't be lost to it.
+        let editable = isDraft && !saving && !flow.library.isSaving(noteID)
         let unsaved = note.state != .saved
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header(binding, editable: isDraft)
+                header(binding, editable: editable)
                 if isDraft { ReviewBand() }
                 switch note.state {
                 case .writing:
@@ -48,7 +50,7 @@ struct NoteView: View {
                             .foregroundStyle(Theme.destructive)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    sections(binding, editable: isDraft)
+                    sections(binding, editable: editable)
                 }
                 if let saveError {
                     Text(saveError)
@@ -117,6 +119,9 @@ struct NoteView: View {
                 .overlay(alignment: .top) { Rectangle().fill(Theme.border).frame(height: 1) }
             }
         }
+        // Typing happens in the keyboard's window, which touch tracking
+        // doesn't see: count edits as activity for auto-lock.
+        .onChange(of: draft) { flow.noteActivity() }
         .task(id: draft) {
             guard draft != nil else { return }
             try? await Task.sleep(for: .seconds(1))
@@ -361,5 +366,5 @@ private func inlineMarkdown(_ s: String) -> AttributedString {
 
 /// Plain-text export for Share and Copy. Generated notes only.
 enum NoteExport {
-    static func markdown(_ note: NoteItem) -> String { NoteMarkdown.render(note) }
+    static func markdown(_ note: NoteItem) -> String { NoteMarkdown.render(note, forExport: true) }
 }

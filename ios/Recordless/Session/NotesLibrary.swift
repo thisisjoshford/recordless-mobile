@@ -87,6 +87,10 @@ final class NotesLibrary {
     /// Called when a notes run ends (finished, failed or cancelled).
     @ObservationIgnored var onWriteFinished: (() -> Void)?
     @ObservationIgnored private var writer: Task<Void, Never>?
+    /// The current write. A task whose token is no longer current was
+    /// cancelled and must not touch the notes, the rewrite backup or a
+    /// newer run's generator state.
+    @ObservationIgnored private var writeToken: UUID?
     /// Bumped by `clear()` (lock): a load or save still awaiting the vault
     /// sees a stale value and drops what it read.
     @ObservationIgnored private var generation = 0
@@ -238,15 +242,23 @@ final class NotesLibrary {
     }
 
     private func write(_ id: UUID, on destination: NotesDestination, scrub: Bool, instructions: String? = nil) {
+        let token = UUID()
+        writeToken = token
         writer = Task { [weak self] in
             guard let self else { return }
-            // The notes live in the draft only: whatever happens below
-            // (discarded, locked, failed), the generator's copy is dropped.
+            let failure = await self.runGenerator(on: destination, scrub: scrub, instructions: instructions)
+            guard self.writeToken == token else {
+                // Cancelled (discard, lock). Drop what this run left in the
+                // generator, unless a newer run owns it now.
+                if self.writeToken == nil { self.generator.clear() }
+                return
+            }
+            self.writeToken = nil
+            // The notes live in the draft only: the generator's copy is dropped.
             defer {
                 self.generator.clear()
                 self.onWriteFinished?()
             }
-            let failure = await self.runGenerator(on: destination, scrub: scrub, instructions: instructions)
             let previous = self.beforeRewrite
             self.beforeRewrite = nil
             // Discarded or locked meanwhile: the note is already gone.
@@ -297,6 +309,7 @@ final class NotesLibrary {
         if generator.running, let session = recorder.session { generator.cancel(session: session) }
         writer?.cancel()
         writer = nil
+        writeToken = nil
         let hadWriting = notes.contains { $0.state == .writing }
         if let previous = beforeRewrite, note(previous.id)?.state == .writing { update(previous) }
         beforeRewrite = nil
@@ -414,7 +427,12 @@ enum NoteMarkdown {
             if line.hasPrefix("# ") {
                 inItem = false
                 let t = stripEmphasis(String(line.dropFirst(2)))
-                if out.title.isEmpty, current == nil, out.sections.isEmpty, !t.hasPrefix("<") {
+                // The template's "<Add Title here>" echoed back: dropped.
+                if t.hasPrefix("<"), t.hasSuffix(">") { return }
+                // The first top-level heading is the title, even after a
+                // stray preamble line, until a titled section has begun.
+                let titledSectionBegun = current?.title.isEmpty == false || out.sections.contains { !$0.title.isEmpty }
+                if out.title.isEmpty, !titledSectionBegun {
                     out.title = t
                 } else if !t.isEmpty {
                     start(t)        // a later top-level heading is a section, not dropped
@@ -459,17 +477,23 @@ enum NoteMarkdown {
         }
     }
 
-    static func render(_ note: NoteItem, metadata: Bool = false) -> String {
+    /// `forExport` (Copy, Share) writes plain markdown with no read-back
+    /// escapes; the notebook copy escapes so it parses back as written.
+    static func render(_ note: NoteItem, metadata: Bool = false, forExport: Bool = false) -> String {
         var out = "# \(oneLine(note.displayTitle))\n\n"
         for section in note.sections {
             if !section.title.isEmpty { out += "**\(oneLine(section.title))**\n\n" }
             let text = section.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
-                out += text.components(separatedBy: .newlines).map(escaped).joined(separator: "\n") + "\n\n"
+                let lines = text.components(separatedBy: .newlines)
+                out += (forExport ? lines : lines.map(escaped)).joined(separator: "\n") + "\n\n"
             }
-            if !section.items.isEmpty {
-                out += section.items.map { item in
-                    let text = oneLine(item.text)
+            let items = section.items.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+            if !items.isEmpty {
+                out += items.map { item in
+                    var text = oneLine(item.text).trimmingCharacters(in: .whitespaces)
+                    // A plain bullet that starts like a checkbox stays plain.
+                    if !forExport, item.done == nil, text.hasPrefix("[") || text.hasPrefix("\\") { text = "\\" + text }
                     return switch item.done {
                     case .some(true): "- [x] \(text)"
                     case .some(false): "- [ ] \(text)"
@@ -537,6 +561,10 @@ enum NoteMarkdown {
             return nil
         }
         var done: Bool?
+        if rest.hasPrefix("\\") {         // escaped by render: literal text
+            let text = rest.dropFirst().trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? nil : (text, nil)
+        }
         if rest.hasPrefix("[ ] ") { done = false; rest = rest.dropFirst(4) }
         else if rest.hasPrefix("[x] ") || rest.hasPrefix("[X] ") { done = true; rest = rest.dropFirst(4) }
         let text = rest.trimmingCharacters(in: .whitespaces)

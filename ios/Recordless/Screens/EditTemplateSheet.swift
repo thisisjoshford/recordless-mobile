@@ -44,6 +44,7 @@ struct EditTemplateSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 SectionLabel("Template")
                 TextField("Template", text: $template, axis: .vertical)
+                    .onChange(of: template) { flow.noteActivity() }
                     .lineLimit(4...8)
                     .font(Theme.font(Theme.Size.body))
                     .foregroundStyle(Theme.foreground)

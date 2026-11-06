@@ -24,7 +24,7 @@ struct BenchmarksView: View {
                 if d.speechUnavailable { StatRow(label: "Speech model", value: "CPU reload failed; rest not transcribed") }
             }
             if recorder.captureStats == nil && recorder.diagnostics == nil {
-                Text("Record something to see the microphone path.").foregroundStyle(.secondary)
+                Text("Start a session to see the microphone path.").foregroundStyle(.secondary)
             }
         } header: {
             Text("Microphone path")
@@ -52,7 +52,7 @@ struct BenchmarksView: View {
             } header: {
                 Text("Settings")
             } footer: {
-                Text("Off by default, as on desktop: memory the CPU used is wiped when freed, GPU memory can't be. The GPU is faster. iOS refuses GPU work in the background, so a GPU run then moves to the CPU. Speech applies from the next recording.")
+                Text("Off by default, as on desktop: memory the CPU used is wiped when freed, GPU memory can't be. The GPU is faster. iOS refuses GPU work in the background, so a GPU run then moves to the CPU. Speech applies from the next session.")
             }
             Section("Memory (live)") {
                 StatRow(label: "phys_footprint", value: Format.bytes(footprint))

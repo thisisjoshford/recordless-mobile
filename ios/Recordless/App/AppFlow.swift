@@ -51,7 +51,12 @@ final class AppFlow {
         let retry: () -> Void = { [weak self] in
             Task { @MainActor in self?.retryAutomaticLock() }
         }
-        library.onWriteFinished = retry
+        // A finished draft restarts the unsaved-notes clock: the person
+        // may have waited out a long write without touching the screen.
+        library.onWriteFinished = { [weak self] in
+            self?.noteActivity()
+            retry()
+        }
         app.recorder.onWorkFinished = retry
         app.generator.onFinished = retry
         app.vault.onNoteSaved = retry

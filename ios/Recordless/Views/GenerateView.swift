@@ -28,14 +28,14 @@ struct GenerateView: View {
         if gen.running { return nil }
         switch recorder.phase {
         case .recording, .loadingModel, .stopping:
-            return "Stop the recording on the Record tab first."
+            return "End the session on the Listen tab first."
         case .idle:
-            return "Record and stop a meeting first."
+            return "Listen to a session and end it first."
         case .stopped:
             break
         }
         if let failure = recorder.stopFailure { return failure }
-        guard recorder.session != nil else { return "Record and stop a meeting first." }
+        guard recorder.session != nil else { return "Listen to a session and end it first." }
         if (recorder.progress?.segments ?? 0) == 0 {
             return "No speech was transcribed in this meeting, so there is nothing to write notes from. Check Bench for the microphone diagnostics."
         }
