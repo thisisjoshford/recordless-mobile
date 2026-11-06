@@ -69,7 +69,7 @@ struct NoteDetailView: View {
     var body: some View {
         ScrollView {
             if let body_ {
-                Text(markdown(body_)).textSelection(.enabled)
+                Text(markdown(body_))
                     .frame(maxWidth: .infinity, alignment: .leading).padding()
             } else if let error {
                 Text(error).foregroundStyle(Theme.destructive).padding()

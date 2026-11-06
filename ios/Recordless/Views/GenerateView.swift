@@ -161,7 +161,7 @@ struct GenerateView: View {
                     }
                 }
                 Section("Notes") {
-                    Text(markdown(r.markdown)).textSelection(.enabled)
+                    Text(markdown(r.markdown))
                 }
                 Section("Save") {
                     TextField("Title", text: $title)

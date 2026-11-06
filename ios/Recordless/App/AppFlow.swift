@@ -356,7 +356,7 @@ final class AppFlow {
     }
 
     #if DEBUG
-    /// `-ui-screen home|notes` opens a screen with sample notes, for checking
+    /// `-ui-screen home|notes|writing` opens a screen with sample notes, for checking
     /// layouts against the design (simulator, no vault).
     func applyDebugScreen() {
         guard let i = CommandLine.arguments.firstIndex(of: "-ui-screen"),
