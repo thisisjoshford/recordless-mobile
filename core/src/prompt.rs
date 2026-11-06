@@ -315,8 +315,9 @@ mod tests {
         let p = build_notes_prompt("x", &ScrubOptions::all(), Some("Send to jo@example.com"));
         assert!(!p.system.contains("jo@example.com") && p.system.contains("<user_instructions>\nSend to [EMAIL]\n"));
         // An identifier straddling the cap is scrubbed before the cut.
-        let edge = format!("{}4111 1111 1111 1111", "a".repeat(MAX_INSTRUCTIONS_CHARS - 10));
-        assert!(!build_notes_prompt("x", &ScrubOptions::all(), Some(&edge)).system.contains("4111 1111"));
+        let edge = format!("{} 4111 1111 1111 1111", "a".repeat(MAX_INSTRUCTIONS_CHARS - 10));
+        let p = build_notes_prompt("x", &ScrubOptions::all(), Some(&edge));
+        assert!(p.system.contains(" [CARD]\n</user_instructions>") && !p.system.contains("4111"));
         assert!(p.system.find("</user_instructions>").unwrap() < p.system.find(NO_VERBATIM_RULE).unwrap());
         let off = ScrubOptions { emails: false, ..ScrubOptions::all() };
         assert!(build_notes_prompt("x", &off, Some("Send to jo@example.com")).system.contains("jo@example.com"));

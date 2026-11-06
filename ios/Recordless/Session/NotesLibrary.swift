@@ -488,7 +488,7 @@ enum NoteMarkdown {
                 let lines = text.components(separatedBy: .newlines)
                 out += (forExport ? lines : lines.map(escaped)).joined(separator: "\n") + "\n\n"
             }
-            let items = section.items.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+            let items = section.items.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             if !items.isEmpty {
                 out += items.map { item in
                     var text = oneLine(item.text).trimmingCharacters(in: .whitespaces)

@@ -28,7 +28,7 @@ struct GenerateView: View {
         if gen.running { return nil }
         switch recorder.phase {
         case .recording, .loadingModel, .stopping:
-            return "End the session on the Listen tab first."
+            return "End the session on the Capture tab first."
         case .idle:
             return "Listen to a session and end it first."
         case .stopped:
@@ -140,7 +140,7 @@ struct GenerateView: View {
             }
 
             if let err = gen.error {
-                Section { Text(err).foregroundStyle(.red).font(.callout) }
+                Section { Text(err).foregroundStyle(Theme.destructive).font(.callout) }
             }
 
             if let report = gen.verification {
@@ -172,7 +172,7 @@ struct GenerateView: View {
                               systemImage: savedID == nil ? "lock.doc" : "checkmark")
                     }
                     .disabled(savedID != nil)
-                    if let saveError { Text(saveError).foregroundStyle(.red).font(.callout) }
+                    if let saveError { Text(saveError).foregroundStyle(Theme.destructive).font(.callout) }
                 }
             }
         }
@@ -242,7 +242,7 @@ struct GenerateView: View {
                 StatRow(label: "Private cloud", value: creditSummary(c))
                 if c.active && c.creditUsedUp {
                     if c.paymentPending { Text("A payment is being added to your credit.").font(.callout) }
-                    if c.disabled { Text("This activation code was turned off.").font(.callout).foregroundStyle(.red) }
+                    if c.disabled { Text("This activation code was turned off.").font(.callout).foregroundStyle(Theme.destructive) }
                     if let exp = c.expiresAt { StatRow(label: "Expires", value: exp) }
                     if let s = c.upgradeUrl, let url = URL(string: s) {
                         Link(destination: url) { Label("Add credit", systemImage: "creditcard") }
@@ -270,7 +270,7 @@ struct GenerateView: View {
                     .disabled(activationCode.trimmingCharacters(in: .whitespaces).isEmpty || gen.redeeming)
                 }
             }
-            if let e = gen.creditError { Text(e).foregroundStyle(.red).font(.callout) }
+            if let e = gen.creditError { Text(e).foregroundStyle(Theme.destructive).font(.callout) }
         } header: {
             Text("Private cloud credit")
         } footer: {
@@ -315,7 +315,7 @@ struct GenerateView: View {
                     }
                 }
             }
-            if let e = gen.modelsError { Text(e).foregroundStyle(.red).font(.caption) }
+            if let e = gen.modelsError { Text(e).foregroundStyle(Theme.destructive).font(.caption) }
             if let v = vault.vault {
                 Button("Refresh model list") { Task { await gen.loadModels(vault: v) } }
                     .disabled(gen.loadingModels)
@@ -458,7 +458,7 @@ private struct VerificationSection: View {
                     }
                 } icon: {
                     Image(systemName: report.passed ? "lock.shield.fill" : "exclamationmark.shield.fill")
-                        .foregroundStyle(report.passed ? .green : .red)
+                        .foregroundStyle(report.passed ? .green : Theme.destructive)
                 }
             }
         }
@@ -468,7 +468,7 @@ private struct VerificationSection: View {
         switch o {
         case .passed: .green
         case .unread: .orange
-        case .failed: .red
+        case .failed: Theme.destructive
         case .notRun: .secondary
         }
     }
