@@ -49,7 +49,7 @@ private struct ModelRow: View {
                     .font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
             if case .failed(let msg) = store.status[spec.id] ?? .missing {
-                Text(msg).font(.caption).foregroundStyle(.red)
+                Text(msg).font(.caption).foregroundStyle(Theme.destructive)
             }
         }
         .padding(.vertical, 2)

@@ -61,10 +61,10 @@ struct RecordView: View {
             }
 
             if let err = recorder.lastError {
-                Section { Text(err).foregroundStyle(.red).font(.callout) }
+                Section { Text(err).foregroundStyle(Theme.destructive).font(.callout) }
             }
         }
-        .navigationTitle("Record")
+        .navigationTitle("Capture")
     }
 
     @ViewBuilder private var statusLine: some View {
@@ -81,9 +81,9 @@ struct RecordView: View {
                     if p?.transcribing == true {
                         Label("Transcribing…", systemImage: "text.bubble").foregroundStyle(.blue)
                     } else if p?.inSpeech == true {
-                        Label("Hearing speech…", systemImage: "waveform").foregroundStyle(.red)
+                        Label("Hearing speech…", systemImage: "waveform").foregroundStyle(Theme.info)
                     } else {
-                        Label("Listening", systemImage: "ear").foregroundStyle(.red)
+                        Label("Listening", systemImage: "ear").foregroundStyle(Theme.primary)
                     }
                     Text(segments == 1 ? "1 segment transcribed" : "\(segments) segments transcribed")
                         .font(.callout).monospacedDigit().foregroundStyle(.secondary)
@@ -121,9 +121,9 @@ struct RecordView: View {
                 guard let spec = selected else { return }
                 Task { await recorder.start(speechModel: store.fileURL(spec), useGpu: useGpu) }
             } label: {
-                Label("Start", systemImage: "record.circle").frame(maxWidth: .infinity)
+                Label("Start", systemImage: "mic.circle").frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent).tint(.red).controlSize(.large)
+            .buttonStyle(.borderedProminent).tint(Theme.primary).controlSize(.large)
             .disabled(selected == nil)
         case .loadingModel, .stopping:
             ProgressView()
@@ -164,6 +164,6 @@ struct LevelMeter: View {
 
     private func color(_ i: Int) -> Color {
         let f = Double(i) / Double(bars)
-        return f > 0.85 ? .red : f > 0.65 ? .orange : .green
+        return f > 0.85 ? Theme.destructive : f > 0.65 ? .orange : .green
     }
 }

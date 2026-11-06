@@ -12,34 +12,8 @@ final class AppModel {
     let generator = NotesGenerator()
     var selectedTab: AppTab = .models
 
-    /// The scene is in the background (set by `RecordlessApp`). While it is,
-    /// a lock that unfinished work refused is retried each time work ends.
-    @ObservationIgnored private(set) var inBackground = false
-
-    init() {
-        // Hooks fire synchronously from inside recorder/generator/vault calls
-        // (including `lock()` itself), so the retry is deferred to a fresh turn.
-        let retry: () -> Void = { [weak self] in
-            Task { @MainActor in self?.lockIfInBackground() }
-        }
-        recorder.onWorkFinished = retry
-        generator.onFinished = retry
-        vault.onNoteSaved = retry
-    }
-
-    /// Called on every scene phase change.
-    func scenePhaseChanged(background: Bool) {
-        inBackground = background
-        lockIfInBackground()
-    }
-
-    /// Lock on entering the background, and again whenever work that refused
-    /// that lock (recording, notes request, unsaved transcript) ends while the
-    /// app is still in the background.
-    private func lockIfInBackground() {
-        guard inBackground else { return }
-        lock()      // idempotent; refused again if other work is still unfinished
-    }
+    // Automatic locks (background, idle) and their retries live in
+    // `AppFlow`, which calls `lock()` / `discardSessionAndLock()` here.
 
     /// What locking would destroy right now (desktop CONFIDENTIAL.md step 7):
     /// a recording, a notes request in flight, or a transcript with no saved
@@ -50,7 +24,7 @@ final class AppModel {
         return recorder.session?.unfinishedWork()
     }
 
-    /// The only lock path. Refused (returning the reason) while there is
+    /// Closes the notebook. Refused (returning the reason) while there is
     /// unfinished work. Otherwise wipes any held transcript (one kept only for
     /// regeneration), clears the generated notes shown on screen, and closes
     /// the notebook.
@@ -80,11 +54,11 @@ extension UnfinishedWork {
     var lockRefusal: String {
         switch self {
         case .recording:
-            "A meeting is being recorded. Stop it before locking the notebook."
+            "A session is in progress. End it before locking the notebook."
         case .generatingNotes:
             "Notes are being written. Wait for them to finish, or cancel, before locking the notebook."
         case .unsavedTranscript:
-            "This meeting has no saved notes yet. Locking would erase its transcript. Save the notes, or discard the session, first."
+            "This session has no saved notes yet. Locking would clear its transcript. Save the notes, or discard the session, first."
         }
     }
 }

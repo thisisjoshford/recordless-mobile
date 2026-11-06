@@ -24,7 +24,7 @@ struct NotebookView: View {
                             }
                         }
                     }
-                    if let error { Text(error).foregroundStyle(.red) }
+                    if let error { Text(error).foregroundStyle(Theme.destructive) }
                 }
                 .navigationDestination(for: String.self) { NoteDetailView(id: $0) }
                 .refreshable { await load() }
@@ -72,7 +72,7 @@ struct NoteDetailView: View {
                 Text(markdown(body_)).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding()
             } else if let error {
-                Text(error).foregroundStyle(.red).padding()
+                Text(error).foregroundStyle(Theme.destructive).padding()
             } else {
                 ProgressView().padding()
             }
@@ -130,7 +130,7 @@ struct VaultGateView: View {
             }
             if vault.busy { ProgressView() }
             if let err = vault.error {
-                Section { Text(err).foregroundStyle(.red).font(.callout) }
+                Section { Text(err).foregroundStyle(Theme.destructive).font(.callout) }
             }
         }
         .confirmationDialog("Start a new notebook?", isPresented: $confirmStartOver, titleVisibility: .visible) {

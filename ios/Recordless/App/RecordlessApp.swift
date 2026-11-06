@@ -43,11 +43,10 @@ struct RecordlessApp: App {
                 #endif
         }
         .onChange(of: scenePhase) { _, phase in
-            // Refused (and the notebook left open) while there is unfinished
-            // work, so backgrounding never destroys a recording, a notes
-            // request or an unsaved transcript. AppModel retries the lock
-            // whenever such work ends while the app is still in the background.
-            app.scenePhaseChanged(background: phase == .background)
+            // The only automatic lock path. Refused (and the notebook left
+            // open) while there is unfinished work, so backgrounding never
+            // destroys a session, a notes run or an unsaved draft; retried
+            // when that work ends while still in the background.
             flow.scenePhaseChanged(phase)
             // Hide content (sheets and covers too) in the app-switcher
             // snapshot and whenever we are not frontmost.

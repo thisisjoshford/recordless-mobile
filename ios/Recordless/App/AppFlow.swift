@@ -3,16 +3,17 @@ import Observation
 
 enum MainTab: Hashable { case listen, notes, settings }
 
-/// Navigation and lock state for the designed UI (SPEC.md "Navigation").
-/// Drives mock session and notes stores until capture and models are wired
-/// in Milestones 6 and 7. Locking always goes through `AppModel.lock()`, so
-/// the real notebook closes with the UI.
+/// Navigation and lock state for the designed UI (SPEC.md "Navigation"),
+/// over the real controllers: `Recorder` (mic into memory, on-device
+/// Whisper), `NotesGenerator` and the encrypted `VaultLock`. This is the
+/// only lock path; it goes through `AppModel.lock()` so the notebook closes
+/// with the UI.
 @Observable
 @MainActor
 final class AppFlow {
     let app: AppModel
-    let session = SessionStore()
-    let library = NotesLibrary()
+    let session: SessionStore
+    let library: NotesLibrary
 
     private(set) var locked = true
     var tab: MainTab = .listen
@@ -21,8 +22,7 @@ final class AppFlow {
     var livePresented = false
     var generatePresented = false
 
-    /// The draft whose transcript is still in memory. Edit template is only
-    /// offered for this note.
+    /// The draft whose transcript is still in memory.
     private(set) var transcriptNoteID: UUID?
 
     /// Desktop's default (`lib/idle-lock.ts`); desktop lets Settings pick
@@ -31,6 +31,17 @@ final class AppFlow {
     /// A paused session left untouched this long is discarded and the
     /// notebook locks, so a forgotten pause can't hold it open.
     static let pausedSessionCap: TimeInterval = 15 * 60
+    /// Unsaved notes left untouched this long are discarded with the
+    /// transcript and the notebook locks, so a forgotten draft can't hold it
+    /// open either.
+    static let unsavedNotesCap: TimeInterval = 15 * 60
+    /// A session still listening with no new speech and no touches this
+    /// long is ended (transcript kept), so a forgotten session can't hold
+    /// the notebook open. The unsaved-notes cap then applies.
+    static let silentSessionCap: TimeInterval = 15 * 60
+    /// Speech-segment count at the last check, and when it last grew.
+    @ObservationIgnored private var lastSegmentCount = 0
+    @ObservationIgnored private var lastSpeechAt = Date()
     /// Shown on the Unlock screen after an automatic discard.
     private(set) var lockNotice: String?
     @ObservationIgnored private var lastActivity = Date()
@@ -39,20 +50,73 @@ final class AppFlow {
 
     init(app: AppModel) {
         self.app = app
-        library.onWriteFinished = { [weak self] in
-            // A notes run that held off a background lock has ended.
-            self?.retryAutomaticLock()
+        session = SessionStore(recorder: app.recorder)
+        library = NotesLibrary(vault: app.vault, generator: app.generator,
+                               recorder: app.recorder, models: app.models)
+        // Work that held off a background lock has ended: try again. Hooks
+        // can fire from inside lock() itself, so retry on a fresh turn.
+        let retry: () -> Void = { [weak self] in
+            Task { @MainActor in self?.retryAutomaticLock() }
         }
+        // A finished draft restarts the unsaved-notes clock: the person
+        // may have waited out a long write without touching the screen.
+        library.onWriteFinished = { [weak self] in
+            self?.noteActivity()
+            retry()
+        }
+        app.recorder.onWorkFinished = retry
+        app.generator.onFinished = retry
+        app.vault.onNoteSaved = retry
     }
 
+    // MARK: Unlock
+
+    /// Opens the encrypted notebook with Face ID (passcode fallback), or
+    /// creates it on first run. Errors are left in `app.vault.error`.
+    func unlock() async {
+        let vault = app.vault
+        switch vault.state {
+        case .noVault: await vault.create()
+        case .locked: await vault.unlock()
+        case .unlocked, .keyLost: break
+        }
+        guard vault.state == .unlocked else { return }
+        library.memoryOnly = false
+        didAuthenticate()
+        await library.load()
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    /// The simulator has no Secure Enclave, so no vault: notes stay in memory.
+    func unlockWithoutVault() {
+        library.memoryOnly = true
+        didAuthenticate()
+    }
+    #endif
+
+    /// The notebook was locked outside this flow (developer tools).
+    func vaultStateChanged() {
+        guard !locked, !library.memoryOnly, app.vault.state != .unlocked else { return }
+        lock(force: true)
+    }
+
+    /// Edit template is offered only for the draft whose transcript is
+    /// still in memory.
     func canRewrite(_ id: UUID) -> Bool {
-        transcriptNoteID == id && session.hasTranscript
+        transcriptNoteID == id && session.hasTranscript && library.sessionBlocker == nil
+            && library.note(id)?.state == .draft && !library.isWriting && !library.isSaving(id)
+    }
+
+    /// Rewrites the draft with the template's instructions.
+    func rewrite(_ id: UUID, template: String, on destination: NotesDestination, scrub: Bool) {
+        guard canRewrite(id) else { return }
+        library.rewrite(id, instructions: template, on: destination, scrub: scrub)
     }
 
     // MARK: Lock
 
     /// Call after the person has authenticated.
-    func didAuthenticate() {
+    private func didAuthenticate() {
         locked = false
         lockNotice = nil
         noteActivity()
@@ -61,8 +125,8 @@ final class AppFlow {
 
     func noteActivity() { lastActivity = Date() }
 
-    /// What locking would destroy right now, as desktop and `AppModel` refuse
-    /// to lock over it. `nil` means locking is allowed.
+    /// What locking would destroy right now, as desktop refuses to lock over
+    /// it. `nil` means locking is allowed.
     var lockBlocker: String? {
         if session.isActive {
             return "A session is in progress. End it before locking the notebook."
@@ -70,27 +134,42 @@ final class AppFlow {
         if library.isWriting {
             return "Notes are being written. Wait for them to finish before locking the notebook."
         }
-        if transcriptNoteID != nil || session.hasTranscript {
-            return "This session's notes aren't saved yet. Locking clears its transcript, so it can't be rewritten from a template."
+        if library.isSaving {
+            return "Notes are being saved. Wait for the save to finish before locking the notebook."
         }
-        return app.unfinishedWork?.lockRefusal
+        if hasUnsavedWork {
+            return "This session's notes aren't saved yet. Locking clears them and the transcript."
+        }
+        return nil
+    }
+
+    /// Unsaved notes, or a transcript notes can still be written from. A
+    /// session that captured no speech or failed to stop has nothing to keep,
+    /// so it doesn't hold the notebook open.
+    private var hasUnsavedWork: Bool {
+        library.notes.contains { $0.state != .saved }
+            || (session.hasTranscript && library.sessionBlocker == nil)
     }
 
     /// Lock button and automatic locks. Without `force`, refused (returning
     /// the reason) while there is unfinished work. With `force`, the person
-    /// chose to discard it: the session, any notes run and the transcript
-    /// are cleared.
+    /// chose to discard it: the session, any notes run, the draft and the
+    /// transcript are cleared.
     @discardableResult
     func lock(force: Bool = false) -> String? {
         if !force, let blocker = lockBlocker { return blocker }
-        if force {
+        library.cancelWriting()
+        // Not blocked but a transcript is held: it has nothing worth keeping
+        // (no speech, or the stop failed), so wipe it with the lock.
+        if force || session.hasTranscript {
             app.discardSessionAndLock()
         } else if let refusal = app.lock() {
             return refusal.lockRefusal
         }
-        library.cancelWriting()
-        releaseTranscript()
+        transcriptNoteID = nil
+        library.clear()
         livePresented = false       // takes the Generate sheet with it
+        generatePresented = false
         listenPath = []
         notesPath = []
         tab = .listen
@@ -101,13 +180,13 @@ final class AppFlow {
 
     /// Locks on backgrounding. A refused lock (unfinished work) is retried
     /// when that work ends while still in the background. Listening keeps
-    /// running in the background, as in the spike.
+    /// running in the background.
     func scenePhaseChanged(_ phase: ScenePhase) {
         inBackground = phase == .background
         if phase == .active {
             // Before touches count as activity: the cap may have passed
             // while the app was suspended.
-            enforcePausedCap()
+            enforceCaps()
             noteActivity()
         }
         retryAutomaticLock()
@@ -124,7 +203,7 @@ final class AppFlow {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
                 guard let self, !self.locked else { return }
-                self.enforcePausedCap()
+                self.enforceCaps()
                 guard !self.locked else { return }
                 // Refused while work is unfinished; checked again next tick.
                 if Date().timeIntervalSince(self.lastActivity) >= Self.idleLockAfter {
@@ -134,30 +213,72 @@ final class AppFlow {
         }
     }
 
-    private func enforcePausedCap(now: Date = Date()) {
-        guard !locked, let since = session.pausedSince else { return }
-        if now.timeIntervalSince(max(since, lastActivity)) >= Self.pausedSessionCap {
+    /// Discards a forgotten paused or interrupted session, ends a forgotten
+    /// silent one, or discards unsaved notes, then locks.
+    private func enforceCaps(now: Date = Date()) {
+        guard !locked else { return }
+        if let since = session.onHoldSince {
+            if now.timeIntervalSince(max(since, lastActivity)) >= Self.pausedSessionCap {
+                let what = session.pausedSince != nil ? "paused" : "interrupted"
+                lock(force: true)
+                lockNotice = "The \(what) session was discarded after 15 minutes. Its transcript was cleared."
+            }
+            return
+        }
+        if session.status == .listening || session.status == .transcribing {
+            if session.segmentCount != lastSegmentCount {
+                lastSegmentCount = session.segmentCount
+                lastSpeechAt = now
+            }
+            if now.timeIntervalSince(max(lastSpeechAt, lastActivity)) >= Self.silentSessionCap {
+                // Restart the clock so the unsaved-notes cap gives the
+                // person another 15 minutes to write notes from it.
+                noteActivity()
+                Task { await endSession() }
+            }
+            return
+        }
+        guard !session.isActive, !library.isWriting, !library.isSaving, hasUnsavedWork else { return }
+        if now.timeIntervalSince(lastActivity) >= Self.unsavedNotesCap {
             lock(force: true)
-            lockNotice = "The paused session was discarded after 15 minutes. Its transcript was cleared."
+            lockNotice = "Unsaved notes were discarded after 15 minutes without activity. The transcript was cleared."
         }
     }
 
     // MARK: Session
 
-    enum StartBlocker: Equatable { case writing, unsavedDraft }
+    enum StartBlocker: Equatable {
+        case writing, unsavedDraft
+        case noSpeechModel(String)
+    }
 
-    /// Starting a new session clears the transcript a draft still holds.
+    var speechModel: ModelSpec? { app.models.ready(.speech).first }
+
     var startBlocker: StartBlocker? {
         if library.isWriting { return .writing }
-        if transcriptNoteID != nil { return .unsavedDraft }
+        if speechModel == nil {
+            if case .downloading = app.models.status[ModelSpec.whisperBase.id] ?? .missing {
+                return .noSpeechModel("The speech model is still downloading. Try again when it's done.")
+            }
+            return .noSpeechModel("Download a speech model first: Settings, Developer tools, Models.")
+        }
+        if transcriptNoteID != nil || library.notes.contains(where: { $0.state == .draft || $0.state == .failed }) {
+            return .unsavedDraft
+        }
         return nil
     }
 
+    /// Starts a session. An unsaved draft from the last one is discarded.
     func startListening() {
-        guard !library.isWriting else { return }
+        guard !library.isWriting, !session.isActive, let spec = speechModel else { return }
         releaseTranscript()
-        session.start()
+        for note in library.notes where note.state == .draft || note.state == .failed { library.discard(note.id) }
         livePresented = true
+        lastSegmentCount = 0
+        lastSpeechAt = Date()
+        let url = app.models.fileURL(spec)
+        let gpu = UserDefaults.standard.bool(forKey: GPUSettings.speechKey)
+        Task { await session.start(speechModel: url, useGpu: gpu) }
     }
 
     func endSession() async {
@@ -166,16 +287,23 @@ final class AppFlow {
     }
 
     func generateNotes(on destination: NotesDestination, scrub: Bool) {
-        let id = library.startDraft(duration: session.elapsed(), on: destination, scrub: scrub)
+        guard let id = library.startDraft(duration: session.elapsed(), on: destination, scrub: scrub) else { return }
         transcriptNoteID = id
         livePresented = false       // takes the Generate sheet with it
         tab = .notes
         notesPath = [id]
     }
 
+    /// Clears the session and any unsaved draft.
     func discardSession() {
+        if let id = transcriptNoteID {
+            guard !library.isSaving(id) else { return }
+            library.discard(id)
+        }
         releaseTranscript()
         livePresented = false
+        listenPath = []
+        notesPath = []
         tab = .listen
     }
 
@@ -193,58 +321,55 @@ final class AppFlow {
         }
     }
 
-    func rewrite(_ id: UUID, template: String, on destination: NotesDestination, scrub: Bool) {
-        guard canRewrite(id) else { return }
-        library.rewrite(id, template: template, on: destination, scrub: scrub)
+    func retry(_ id: UUID, on destination: NotesDestination? = nil, scrub: Bool) {
+        guard transcriptNoteID == id else { return }
+        library.retry(id, on: destination, scrub: scrub)
     }
 
-    /// Keeps only the notes and clears the transcript.
-    func save(_ note: NoteItem) {
+    /// Saves to the encrypted notebook, keeping only the notes and clearing
+    /// the transcript. Returns an error message if the save failed.
+    func save(_ note: NoteItem) async -> String? {
+        guard !library.isSaving(note.id) else { return nil }
         library.update(note)
-        library.save(note.id)
-        if transcriptNoteID == note.id { releaseTranscript() }
+        do {
+            guard try await library.save(note.id) else { return nil }
+        } catch {
+            return "Couldn't save the notes: \(describe(error))"
+        }
+        // Locked during the save: the notebook is closed and cleared already.
+        guard !locked else { return nil }
+        if transcriptNoteID == note.id {
+            app.recorder.session?.markNotesSaved()
+            releaseTranscript()
+        }
         AccessibilityNotification.Announcement("Notes saved. The transcript was cleared.").post()
         listenPath = []
         notesPath = []
         tab = .notes
+        return nil
     }
 
     private func releaseTranscript() {
         session.clear()
+        app.generator.clear()
         transcriptNoteID = nil
     }
 
     #if DEBUG
-    /// Screenshot hook: the Note screen opens Edit template once.
-    var debugTemplate = false
-
-    /// `-ui-screen home|live|generate|note|template|notes` opens a screen on
-    /// mock data, for checking layouts against the design.
+    /// `-ui-screen home|notes` opens a screen with sample notes, for checking
+    /// layouts against the design (simulator, no vault).
     func applyDebugScreen() {
         guard let i = CommandLine.arguments.firstIndex(of: "-ui-screen"),
               i + 1 < CommandLine.arguments.count else { return }
         let screen = CommandLine.arguments[i + 1]
         guard screen != "unlock" else { return }
+        library.memoryOnly = true
         didAuthenticate()
-        switch screen {
-        case "notes": tab = .notes
-        case "live", "generate":
-            startListening()
-            if screen == "generate" {
-                Task {
-                    try? await Task.sleep(for: .seconds(6))
-                    await endSession()
-                }
-            }
-        case "note", "template":
-            startListening()
-            Task {
-                try? await Task.sleep(for: .seconds(5))
-                await session.end()
-                generateNotes(on: .onDevice, scrub: true)
-                if screen == "template" { debugTemplate = true }
-            }
-        default: break
+        library.insertSamples()
+        if screen == "notes" { tab = .notes }
+        if screen == "writing" {
+            tab = .notes
+            notesPath = [library.insertWritingSample()]
         }
     }
     #endif

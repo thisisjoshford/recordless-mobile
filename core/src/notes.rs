@@ -459,6 +459,7 @@ pub(crate) struct Run<'a> {
     pub api_key: &'a str,
     pub model_id: Option<String>,
     pub scrub: ScrubOptions,
+    pub instructions: Option<String>,
     pub status: Arc<Mutex<LiveStatus>>,
 }
 
@@ -622,7 +623,7 @@ impl Run<'_> {
             Zeroizing::new(scrubbed_transcript.to_string())
         };
 
-        let final_prompt = build_notes_prompt(&content, &self.scrub);
+        let final_prompt = build_notes_prompt(&content, &self.scrub, self.instructions.as_deref());
         drop(content);
         let cleaned = self
             .complete(&model, &final_prompt.system, &final_prompt.user, &mut totals, "Final summary")

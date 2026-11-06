@@ -240,7 +240,7 @@ mod tests {
 
         if let Ok(llm) = std::env::var("RECORDLESS_TEST_LLM") {
             let gpu = std::env::var("RECORDLESS_TEST_LLM_CPU").is_err();
-            let r = session.generate_notes_on_device(llm, gpu, ScrubOptions::all()).unwrap();
+            let r = session.generate_notes_on_device(llm, gpu, ScrubOptions::all(), None).unwrap();
             eprintln!("{}\n{:?} requests {} prompt {} generated {} elapsed {} ms", r.markdown, r.local, r.requests, r.prompt_tokens, r.generated_tokens, r.elapsed_ms);
             assert_eq!(r.location, NotesLocation::OnDevice);
             assert!(r.markdown.contains('#'));

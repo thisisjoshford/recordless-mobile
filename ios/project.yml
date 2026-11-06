@@ -58,7 +58,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Recordless/Support/Recordless.entitlements
         OTHER_LDFLAGS: "$(inherited) -lc++"
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""   # no app icon designed yet
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon   # Resources/AppIcon.icon, shared with desktop
     info:
       path: Recordless/Support/Info.plist
       properties:

@@ -263,6 +263,7 @@ impl Session {
         vault: Arc<Vault>,
         model_id: Option<String>,
         scrub: ScrubOptions,
+        instructions: Option<String>,
     ) -> Result<NotesResult, CoreError> {
         if self.worker.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Err(CoreError::InvalidState { msg: "call stop() before generate_notes()".into() });
@@ -279,7 +280,7 @@ impl Session {
 
         let transcript = self.scrubbed_transcript(&scrub)?;
 
-        let run = notes::Run { api_key: &api_key, model_id, scrub, status: Arc::clone(&self.notes_status) };
+        let run = notes::Run { api_key: &api_key, model_id, scrub, instructions, status: Arc::clone(&self.notes_status) };
         let outcome = nearai::runtime().block_on(async {
             tokio::select! {
                 result = run.run(&transcript) => Some(result),
@@ -323,6 +324,7 @@ impl Session {
         model_path: String,
         use_gpu: bool,
         scrub: ScrubOptions,
+        instructions: Option<String>,
     ) -> Result<NotesResult, CoreError> {
         if self.worker.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Err(CoreError::InvalidState { msg: "call stop() before generating notes".into() });
@@ -336,6 +338,7 @@ impl Session {
             model_path: &model_path,
             use_gpu,
             scrub,
+            instructions,
             status: Arc::clone(&self.notes_status),
             cancel: &cancel.flag,
         };
@@ -838,7 +841,7 @@ mod tests {
             }
             store.finalize();
         }
-        let r = s.generate_notes_on_device(llm, true, ScrubOptions::all()).unwrap_or_else(|e| panic!("{e}"));
+        let r = s.generate_notes_on_device(llm, true, ScrubOptions::all(), None).unwrap_or_else(|e| panic!("{e}"));
         eprintln!("{}\nrequests {} prompt {} generated {} {:?}", r.markdown, r.requests, r.prompt_tokens, r.generated_tokens, r.local);
         assert!(r.requests >= 4, "chunked: {}", r.requests);
     }
@@ -853,7 +856,7 @@ mod tests {
         assert!(matches!(s.stop(), Err(CoreError::MemoryLock { .. })), "stop stays failed");
         assert_eq!(s.unfinished_work(), None, "nothing left to block lock");
         assert!(matches!(
-            s.generate_notes_on_device("/nonexistent.gguf".into(), false, ScrubOptions::all()),
+            s.generate_notes_on_device("/nonexistent.gguf".into(), false, ScrubOptions::all(), None),
             Err(CoreError::InvalidState { .. })
         ));
     }

@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import Observation
+import os
 
 /// Drives one meeting: Session lifecycle + AudioCapture + ~1 Hz progress polling.
 /// Only counts and timings are surfaced. Transcript text never reaches Swift.
@@ -20,6 +21,8 @@ final class Recorder {
     private(set) var stoppedAt: Date?
     private(set) var level: Float = 0
     private(set) var interrupted = false
+    /// When capture was cut off (call, Siri, failed restart), or nil.
+    private(set) var interruptedAt: Date?
     private(set) var progress: SessionProgress?
     private(set) var speechStats: SpeechStats?
     private(set) var modelLoadMs: UInt64?
@@ -37,6 +40,13 @@ final class Recorder {
     /// The stopped session, handed to NotesGenerator. Cleared on discard.
     private(set) var session: Session?
 
+    /// Paused: audio is dropped in memory before it reaches the core.
+    private(set) var paused = false
+    private(set) var pausedAt: Date?
+    /// Paused time so far, excluded from `elapsed`.
+    private(set) var pausedTotal: TimeInterval = 0
+    private let pauseGate = OSAllocatedUnfairLock(initialState: false)
+
     private let capture = AudioCapture()
     private var pollTask: Task<Void, Never>?
     /// Bumped by `discard()`. `start()`/`stop()` capture it before each await
@@ -50,9 +60,35 @@ final class Recorder {
 
     var isCapturing: Bool { phase == .recording || phase == .loadingModel || phase == .stopping }
 
-    var elapsed: TimeInterval {
+    var elapsed: TimeInterval { elapsed(at: Date()) }
+
+    /// Listening time, without paused time.
+    func elapsed(at now: Date) -> TimeInterval {
         guard let startedAt else { return 0 }
-        return (stoppedAt ?? Date()).timeIntervalSince(startedAt)
+        let end = stoppedAt ?? pausedAt ?? now
+        return max(0, end.timeIntervalSince(startedAt) - pausedTotal)
+    }
+
+    func pause() {
+        guard phase == .recording, !paused else { return }
+        pauseGate.withLock { $0 = true }
+        paused = true
+        pausedAt = Date()
+    }
+
+    func resume() {
+        guard phase == .recording, paused, let pausedAt else { return }
+        pauseGate.withLock { $0 = false }
+        pausedTotal += Date().timeIntervalSince(pausedAt)
+        self.pausedAt = nil
+        paused = false
+    }
+
+    private func resetPause() {
+        pauseGate.withLock { $0 = false }
+        paused = false
+        pausedAt = nil
+        pausedTotal = 0
     }
 
     init() {
@@ -63,15 +99,24 @@ final class Recorder {
             Task { @MainActor in
                 guard let self else { return }
                 switch state {
-                case .interrupted: self.interrupted = true
-                case .running: self.interrupted = false
+                case .interrupted: self.setInterrupted(true)
+                case .running:
+                    self.setInterrupted(false)
+                    if self.lastError?.hasPrefix("Microphone: ") == true { self.lastError = nil }
                 case .failed(let msg):
-                    self.interrupted = true
+                    self.setInterrupted(true)
                     self.lastError = "Microphone: \(msg)"
                 case .stopped: break
                 }
             }
         }
+    }
+
+    private func setInterrupted(_ value: Bool) {
+        guard phase == .recording || !value else { return }
+        if value, !interrupted { interruptedAt = Date() }
+        if !value { interruptedAt = nil }
+        interrupted = value
     }
 
     func start(speechModel: URL, useGpu: Bool) async {
@@ -116,8 +161,11 @@ final class Recorder {
         captureStats = nil
         pushErrors = 0
 
+        resetPause()
+        let gate = pauseGate
         do {
-            try capture.start { [weak self] samples in
+            // Paused audio is dropped in the tap, at capture time, never stored.
+            try capture.start(isPaused: { gate.withLock { $0 } }) { [weak self] samples in
                 do {
                     try session.pushAudio(samples: samples)
                 } catch {
@@ -128,6 +176,7 @@ final class Recorder {
                 }
             }
         } catch {
+            capture.stop()      // a half-started capture must not restart itself later
             lastError = "Could not start microphone: \(error.localizedDescription)"
             Task.detached { session.discard() }
             self.session = nil
@@ -146,6 +195,9 @@ final class Recorder {
         guard phase == .recording, let session else { return }
         let gen = generation
         phase = .stopping
+        if let pausedAt { pausedTotal += Date().timeIntervalSince(pausedAt) }
+        pausedAt = nil
+        paused = false
         stoppedAt = Date()
         capture.stop()          // drains queued pushes
         pollTask?.cancel()
@@ -160,9 +212,9 @@ final class Recorder {
         case .success(let p): progress = p
         case .failure(let error):
             if case CoreError.MemoryLock = error {
-                stopFailure = "Protected memory failed while recording, so the transcript was discarded and notes can't be written from this meeting. Discard it and record again."
+                stopFailure = "Protected memory failed during the session, so the transcript was discarded and notes can't be written from it. Discard this session and start a new one."
             } else {
-                stopFailure = "Stopping the recording failed (\(describe(error))), so notes can't be written from this meeting. Discard it and record again."
+                stopFailure = "Ending the session failed (\(describe(error))), so notes can't be written from it. Discard this session and start a new one."
             }
             lastError = "stop(): \(describe(error))"
         }
@@ -196,7 +248,10 @@ final class Recorder {
         startedAt = nil
         stoppedAt = nil
         interrupted = false
+        interruptedAt = nil
+        lastError = nil         // no stale error on the next session's screen
         level = 0
+        resetPause()
         phase = .idle
         onWorkFinished?()
     }

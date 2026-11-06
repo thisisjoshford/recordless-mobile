@@ -24,8 +24,16 @@ struct LiveSessionView: View {
                 Spacer(minLength: 0)
                 StatusPill(status: session.status)
             }
-            MicLevelCard(level: session.level, active: session.status == .listening || session.status == .transcribing)
-            CapturedCard(segments: session.segments, wordCount: session.wordCount)
+            MicLevelCard(level: session.status == .interrupted ? 0 : session.level,
+                         active: session.status == .listening || session.status == .transcribing)
+            CapturedCard(segments: session.segments)
+            if let problem = session.problem {
+                Text(problem)
+                    .font(Theme.font(Theme.Size.secondary, .semibold))
+                    .foregroundStyle(Theme.destructive)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             controls(session)
         }
         .padding(.horizontal, Theme.Spacing.screenSide)
@@ -38,20 +46,27 @@ struct LiveSessionView: View {
         }
     }
 
+    @ViewBuilder
     private func controls(_ session: SessionStore) -> some View {
         let paused = session.status == .paused
-        let busy = session.status == .finishing || session.status == .ended
-        return HStack(spacing: 12) {
+        let interrupted = session.status == .interrupted
+        let busy = session.status != .listening && session.status != .transcribing && !paused && !interrupted
+        if session.status == .idle {
+            // Didn't start (microphone off, model failed to load).
+            PrimaryButton(title: "Close", systemImage: "xmark") { flow.discardSession() }
+        } else {
+        HStack(spacing: 12) {
             CircleIconButton(systemImage: paused ? "play.fill" : "pause.fill",
                              label: paused ? "Resume" : "Pause",
                              size: Theme.Spacing.primaryButton, iconSize: 20) {
                 paused ? session.resume() : session.pause()
             }
-            .disabled(busy)
+            .disabled(busy || interrupted)
             PrimaryButton(title: "End session", systemImage: "stop.fill") {
                 Task { await flow.endSession() }
             }
             .disabled(busy)
+        }
         }
     }
 }
@@ -79,9 +94,12 @@ struct StatusPill: View {
 
     private var label: String {
         switch status {
-        case .idle, .listening: "Listening…"
+        case .idle: "Not listening"
+        case .starting: "Starting…"
+        case .listening: "Listening…"
         case .transcribing: "Transcribing…"
         case .paused: "Paused"
+        case .interrupted: "Interrupted"
         case .finishing: "Finishing…"
         case .ended: "Session ended"
         }
@@ -89,7 +107,9 @@ struct StatusPill: View {
 
     @ViewBuilder private var icon: some View {
         switch status {
-        case .idle, .listening:
+        case .idle:
+            Image(systemName: "mic.slash").font(.system(size: 12, weight: .bold))
+        case .listening:
             HStack(alignment: .center, spacing: 2) {
                 ForEach([4.0, 10, 14, 6], id: \.self) { h in
                     Capsule().fill(Theme.primary).frame(width: 3, height: h)
@@ -103,7 +123,9 @@ struct StatusPill: View {
             }
         case .paused:
             Image(systemName: "pause.fill").font(.system(size: 12, weight: .bold))
-        case .finishing:
+        case .interrupted:
+            Image(systemName: "mic.slash").font(.system(size: 12, weight: .bold))
+        case .starting, .finishing:
             ProgressView().controlSize(.small).tint(Theme.primary)
         case .ended:
             Image(systemName: "checkmark").font(.system(size: 12, weight: .bold))
@@ -118,8 +140,6 @@ struct MicLevelCard: View {
     let active: Bool
 
     var body: some View {
-        let lit = SegmentedLevelBar.lit(for: level)
-        let (label, color) = Self.label(lit: lit)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "mic").font(.system(size: 14)).foregroundStyle(Theme.foreground)
@@ -127,9 +147,6 @@ struct MicLevelCard: View {
                 Text("iPhone Microphone").font(Theme.font(Theme.Size.secondary, .semibold))
                     .foregroundStyle(Theme.foreground)
                 Spacer()
-                if active {
-                    Text(label).font(Theme.font(Theme.Size.secondary, .bold)).foregroundStyle(color)
-                }
             }
             SegmentedLevelBar(level: active ? level : 0)
         }
@@ -137,26 +154,17 @@ struct MicLevelCard: View {
         .padding(.vertical, 12)
         .cardStyle(radius: Theme.Radius.input, shadow: false)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(active ? "Microphone level: \(label)" : "Microphone paused")
-    }
-
-    /// Thresholds are an open question in SPEC.md; tune on device.
-    static func label(lit: Int) -> (String, Color) {
-        switch lit {
-        case ...3: ("Too quiet", Theme.warning)
-        case 15...: ("Too loud", Theme.meterHotText)
-        default: ("Good level", Theme.success)
-        }
+        .accessibilityLabel(active ? "Microphone on" : "Microphone paused")
     }
 }
 
 // MARK: - Captured
 
-/// Word counts drawn as blocks. Block widths are pseudo-random per word
-/// position, not real word lengths, so nothing about the words shows.
+/// Segments drawn as blocks. Block counts and widths are pseudo-random per
+/// segment, not real words, so nothing about the speech shows.
 struct CapturedCard: View {
     let segments: [CapturedSegment]
-    let wordCount: Int
+    private var count: Int { segments.count }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -165,7 +173,7 @@ struct CapturedCard: View {
                     Text("Captured").font(Theme.font(Theme.Size.row, .bold)).foregroundStyle(Theme.primary)
                         .accessibilityAddTraits(.isHeader)
                     Spacer()
-                    Text("\(wordCount.formatted()) \(wordCount == 1 ? "word" : "words")")
+                    Text("\(count.formatted()) \(count == 1 ? "segment" : "segments")")
                         .font(Theme.font(Theme.Size.secondary, .semibold))
                         .monospacedDigit()
                         .foregroundStyle(Theme.foreground)
@@ -185,7 +193,7 @@ struct CapturedCard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityHidden(true)
 
-            Text("Words are counted, never shown. The transcript clears when you save notes or discard.")
+            Text("Speech is counted, never shown. The transcript clears when you save notes or discard.")
                 .font(Theme.font(Theme.Size.sectionLabel, relativeTo: .caption))
                 .foregroundStyle(Theme.mutedForeground)
                 .padding(.horizontal, 18)
@@ -248,7 +256,7 @@ private struct WordBlocks: View {
         var tail: [CapturedSegment] = []
         for seg in segments.reversed() where budget > 0 {
             tail.append(seg)
-            budget -= seg.wordCount
+            budget -= seg.blockCount
         }
         tail.reverse()
 
@@ -257,7 +265,7 @@ private struct WordBlocks: View {
         for (offset, seg) in tail.enumerated() {
             let age = tail.count - 1 - offset
             let opacity = age == 0 ? 0.72 : age == 1 ? 0.5 : age <= 3 ? 0.32 : 0.2
-            var count = seg.wordCount
+            var count = seg.blockCount
             if seg.id > shownThrough {
                 count = revealed?.id == seg.id ? min(count, revealed?.count ?? 0) : 0
             }
@@ -276,9 +284,9 @@ private struct WordBlocks: View {
 
     private func reveal() async {
         guard let newest = segments.last, newest.id > shownThrough else { return }
-        if !reduceMotion, newest.wordCount > 1 {
-            let step = min(0.14, 2.0 / Double(newest.wordCount))
-            for n in 1...newest.wordCount {
+        if !reduceMotion, newest.blockCount > 1 {
+            let step = min(0.14, 2.0 / Double(newest.blockCount))
+            for n in 1...newest.blockCount {
                 revealed = (newest.id, n)
                 try? await Task.sleep(for: .seconds(step))
                 if Task.isCancelled { return }

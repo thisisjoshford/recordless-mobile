@@ -1,4 +1,3 @@
-import LocalAuthentication
 import SwiftUI
 
 /// SPEC 1, `Main.dc.html`. The notebook has no passphrase (Face ID, with the
@@ -6,8 +5,8 @@ import SwiftUI
 /// instead" link is left out.
 struct UnlockView: View {
     @Environment(AppFlow.self) private var flow
-    @State private var message: String?
-    @State private var busy = false
+    @State private var confirmStartOver = false
+    private var vault: VaultLock { flow.app.vault }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,38 +26,27 @@ struct UnlockView: View {
             }
             Spacer(minLength: 24)
             VStack(spacing: 14) {
-                Label("Notebook locked", systemImage: "lock")
-                    .font(Theme.font(Theme.Size.secondary, .semibold))
-                    .foregroundStyle(Theme.mutedForeground)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(Theme.secondary, in: Capsule())
+                actions
 
-                PrimaryButton(title: "Unlock with Face ID", systemImage: "faceid") {
-                    Task { await unlock() }
-                }
-                .disabled(busy)
-
-                if let notice = flow.lockNotice, message == nil {
+                if let notice = flow.lockNotice, vault.error == nil {
                     Text(notice)
                         .font(Theme.font(Theme.Size.secondary, .semibold))
                         .foregroundStyle(Theme.mutedForeground)
                         .multilineTextAlignment(.center)
                 }
 
-                if let message {
+                if let message = vault.error {
                     Text(message)
                         .font(Theme.font(Theme.Size.secondary, .semibold))
                         .foregroundStyle(Theme.destructive)
                         .multilineTextAlignment(.center)
                 }
 
-                Text("Your notes are encrypted on this device. Recordless never stores audio or transcripts.")
+                Text("Your notes are encrypted on this device.\nRecordless never stores audio or transcripts.")
                     .font(Theme.font(Theme.Size.meta, relativeTo: .footnote))
                     .foregroundStyle(Theme.mutedForeground)
                     .multilineTextAlignment(.center)
                     .lineSpacing(2)
-                    .frame(maxWidth: 300)
                     .padding(.top, 6)
             }
         }
@@ -68,30 +56,43 @@ struct UnlockView: View {
         .screenBackground()
     }
 
-    /// Face ID, with the device passcode as the system fallback. Milestone 5
-    /// replaces this with VaultLock, which unwraps the notebook key in the
-    /// Secure Enclave under the same check.
-    private func unlock() async {
-        busy = true
-        defer { busy = false }
-        message = nil
-        let context = LAContext()
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+    @ViewBuilder private var actions: some View {
+        switch vault.state {
+        case .noVault:
             #if DEBUG && targetEnvironment(simulator)
-            flow.didAuthenticate()      // simulator without Face ID enrolled
+            PrimaryButton(title: "Continue without a notebook", systemImage: "iphone") {
+                flow.unlockWithoutVault()
+            }
+            Text("Simulator only: there's no Secure Enclave, so notes stay in memory until you lock.")
+                .font(Theme.font(Theme.Size.meta, relativeTo: .footnote))
+                .foregroundStyle(Theme.mutedForeground)
+                .multilineTextAlignment(.center)
             #else
-            message = "Set a passcode for this iPhone to use Recordless."
+            PrimaryButton(title: "Create notebook", systemImage: "lock.shield") {
+                Task { await flow.unlock() }
+            }
+            .disabled(vault.busy || vault.createBlocker != nil)
+            Text(vault.createBlocker ?? "Notes are encrypted with a key that never leaves this iPhone. Only Face ID or your passcode can open it.")
+                .font(Theme.font(Theme.Size.meta, relativeTo: .footnote))
+                .foregroundStyle(Theme.mutedForeground)
+                .multilineTextAlignment(.center)
             #endif
-            return
-        }
-        do {
-            try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock your notebook")
-            flow.didAuthenticate()
-        } catch let e as LAError where [.userCancel, .appCancel, .systemCancel].contains(e.code) {
-            // Cancelled: no message.
-        } catch {
-            message = "Didn't recognise that. Try again, or use your iPhone passcode."
+        case .locked, .unlocked:
+            PrimaryButton(title: "Unlock with Face ID", systemImage: "faceid") {
+                Task { await flow.unlock() }
+            }
+            .disabled(vault.busy)
+        case .keyLost:
+            Text("This notebook's key is no longer on this iPhone (for example, the passcode was turned off), so it can't be opened.")
+                .font(Theme.font(Theme.Size.secondary))
+                .foregroundStyle(Theme.foreground)
+                .multilineTextAlignment(.center)
+            SecondaryButton(title: "Start a new notebook", systemImage: "plus") { confirmStartOver = true }
+                .confirmationDialog("Start a new notebook?", isPresented: $confirmStartOver, titleVisibility: .visible) {
+                    Button("Set old notebook aside", role: .destructive) { vault.setAsideAndStartOver() }
+                } message: {
+                    Text("The old notebook is moved aside and kept, not deleted. Its notes stay unreadable.")
+                }
         }
     }
 }

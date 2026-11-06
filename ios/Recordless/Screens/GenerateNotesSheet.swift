@@ -7,7 +7,6 @@ struct GenerateNotesSheet: View {
     @Environment(AppFlow.self) private var flow
     @State private var destination: NotesDestination = .onDevice
     @State private var scrub = ScrubSetting()
-    @State private var attestation: Attestation = .checking
     @State private var confirmDiscard = false
 
     var body: some View {
@@ -19,7 +18,7 @@ struct GenerateNotesSheet: View {
                     .font(Theme.font(Theme.Size.sheetTitle, .bold, relativeTo: .title))
                     .foregroundStyle(Theme.foreground)
                     .accessibilityAddTraits(.isHeader)
-                Text("\(DurationFormat.minutes(session.elapsed())) · \(session.wordCount.formatted()) words held in memory. They clear once you save notes or discard.")
+                Text("\(DurationFormat.minutes(session.elapsed())) · \(session.segmentCount.formatted()) \(session.segmentCount == 1 ? "segment" : "segments") held in memory. They clear once you save notes or discard.")
                     .font(Theme.font(Theme.Size.control))
                     .foregroundStyle(Theme.mutedForeground)
                     .lineSpacing(3)
@@ -35,7 +34,7 @@ struct GenerateNotesSheet: View {
                           detail: "A secure enclave on NEAR AI. Text is sent only after its attestation verifies.",
                           selected: destination == .privateCloud) { destination = .privateCloud }
                 if destination == .privateCloud {
-                    AttestationRow(state: attestation)
+                    AttestationRow(state: flow.library.cloudReadiness)
                 }
             }
 
@@ -44,8 +43,15 @@ struct GenerateNotesSheet: View {
                        isOn: $scrub.requestedIsOn)
 
             VStack(spacing: 8) {
+                if let blocker {
+                    Text(blocker)
+                        .font(Theme.font(Theme.Size.secondary, .semibold))
+                        .foregroundStyle(Theme.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 PrimaryButton(title: "Generate notes") { flow.generateNotes(on: destination, scrub: scrub.isOn) }
-                    .disabled(destination == .privateCloud && attestation != .verified)
+                    .disabled(blocker != nil || flow.library.isWriting
+                              || destination == .privateCloud && flow.library.cloudReadiness != .ready)
                 Button("Discard session", role: .destructive) { confirmDiscard = true }
                     .buttonStyle(TextButtonStyle(color: Theme.destructive))
                     .frame(maxWidth: .infinity)
@@ -60,40 +66,39 @@ struct GenerateNotesSheet: View {
             Button("Keep session", role: .cancel) {}
         }
         .task(id: destination) {
-            guard destination == .privateCloud else { return }
-            attestation = .checking
-            #if DEBUG
-            // Mock until Milestone 7 wires the NEAR AI check (verified on the
-            // same TLS connection that carries the prompt). Debug builds only.
-            try? await Task.sleep(for: .seconds(1.2))
-            if !Task.isCancelled { attestation = .verified }
-            #else
-            attestation = .unavailable
-            #endif
+            if destination == .privateCloud { await flow.library.refreshCloud() }
+        }
+    }
+
+    /// Why Generate is disabled, or nil.
+    private var blocker: String? {
+        if let b = flow.library.sessionBlocker { return b }
+        switch destination {
+        case .onDevice: return flow.library.onDeviceBlocker
+        case .privateCloud: return nil        // shown by AttestationRow
         }
     }
 }
 
-enum Attestation: Equatable { case checking, verified, notVerified, unavailable }
-
+/// Whether the private cloud can take the request. The enclave's
+/// attestation is verified by the core on the connection that carries the
+/// notes; nothing is sent unless it passes.
 struct AttestationRow: View {
-    let state: Attestation
+    let state: NotesLibrary.CloudReadiness
 
     var body: some View {
         HStack(spacing: 8) {
             switch state {
             case .checking:
                 ProgressView().controlSize(.mini).tint(Theme.info)
-                Text("Checking attestation…").foregroundStyle(Theme.info)
-            case .verified:
+                Text("Checking the private cloud…").foregroundStyle(Theme.info)
+            case .ready:
                 Image(systemName: "checkmark.seal").foregroundStyle(Theme.success)
-                Text("Attestation verified").foregroundStyle(Theme.success)
-            case .notVerified:
-                Image(systemName: "xmark.seal").foregroundStyle(Theme.destructive)
-                Text("Attestation not verified. Nothing will be sent.").foregroundStyle(Theme.destructive)
-            case .unavailable:
+                Text("Attestation is verified before anything is sent").foregroundStyle(Theme.success)
+            case .unavailable(let reason):
                 Image(systemName: "icloud.slash").foregroundStyle(Theme.mutedForeground)
-                Text("Private cloud unavailable").foregroundStyle(Theme.mutedForeground)
+                Text(reason).foregroundStyle(Theme.mutedForeground)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .font(Theme.font(Theme.Size.meta, .semibold, relativeTo: .footnote))

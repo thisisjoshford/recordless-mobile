@@ -2,14 +2,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// SPEC 5, `Note.dc.html`. Drafts are editable and have the review band and
-/// bottom bar; saved notes are read-only for now.
+/// bottom bar; saved notes are read-only (the notebook can't update a note).
 struct NoteView: View {
     @Environment(AppFlow.self) private var flow
     let noteID: UUID
     @State private var editingTemplate = false
-    /// Local edits, written to the notebook after a pause, on leaving, and
-    /// before Save or Edit template (not on every keystroke).
+    /// Local edits, written to the library after a pause, on leaving, and
+    /// before Save (not on every keystroke).
     @State private var draft: NoteItem?
+    @State private var saving = false
+    @State private var saveError: String?
+    @State private var confirmDiscard = false
 
     var body: some View {
         if let note = flow.library.note(noteID) {
@@ -24,30 +27,49 @@ struct NoteView: View {
             get: { draft ?? note },
             set: { draft = $0 })
         let isDraft = note.state == .draft
-        let canRewrite = flow.canRewrite(noteID)
+        // Locked while a save is in flight, so edits can't be lost to it.
+        let editable = isDraft && !saving && !flow.library.isSaving(noteID)
+        let unsaved = note.state != .saved
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                header(binding, editable: isDraft)
+                header(binding, editable: editable)
                 if isDraft { ReviewBand() }
                 switch note.state {
-                case .writing, .queued:
-                    HStack(spacing: 8) {
-                        ProgressRing()
-                        Text(note.state == .queued ? "Queued"
-                             : note.writtenOn == .onDevice ? "Writing notes on this iPhone…" : "Writing notes in the private cloud…")
-                    }
-                    .font(Theme.font(Theme.Size.secondary, .semibold))
-                    .foregroundStyle(Theme.info)
+                case .writing:
+                    WritingBand(onDevice: note.writtenOn != .privateCloud, step: flow.library.writingStep)
+                case .failed:
+                    let canRetry = flow.session.hasTranscript && flow.library.sessionBlocker == nil
+                    let other: NotesDestination = note.writtenOn == .privateCloud ? .onDevice : .privateCloud
+                    // Retries scrub everything, the default; no confirmation needed.
+                    FailedBand(message: note.error ?? "Notes couldn't be written.",
+                               canRetry: canRetry,
+                               alternative: canRetry && flow.library.isAvailable(other) ? other : nil,
+                               retry: { flow.retry(noteID, on: $0, scrub: true) })
+                    .task { await flow.library.refreshCloud() }
                 case .draft, .saved:
-                    sections(binding, editable: isDraft)
+                    if isDraft, let error = note.error {
+                        Text(error)
+                            .font(Theme.font(Theme.Size.secondary, .semibold))
+                            .foregroundStyle(Theme.destructive)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    sections(binding, editable: editable)
+                }
+                if let saveError {
+                    Text(saveError)
+                        .font(Theme.font(Theme.Size.secondary, .semibold))
+                        .foregroundStyle(Theme.destructive)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, Theme.Spacing.screenSide)
             .padding(.top, 4)
             .padding(.bottom, 16)
         }
         .scrollDismissesKeyboard(.interactively)
+        // Notes text stays out of the keyboard's learned words.
+        .autocorrectionDisabled()
         .screenBackground()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
@@ -58,7 +80,7 @@ struct NoteView: View {
                     Image(systemName: "square.and.arrow.up")
                 }
                 .accessibilityLabel("Share")
-                .disabled(note.state == .writing || note.state == .queued)
+                .disabled(note.state == .writing || note.state == .failed)
                 Menu {
                     Button("Copy notes", systemImage: "doc.on.doc") {
                         // This device only (no Universal Clipboard), and
@@ -67,6 +89,10 @@ struct NoteView: View {
                             [[UTType.utf8PlainText.identifier: NoteExport.markdown(draft ?? note)]],
                             options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(180)])
                     }
+                    .disabled(note.state == .writing || note.state == .failed)
+                    if unsaved && flow.canRewrite(noteID) {
+                        Button("Discard notes", systemImage: "trash", role: .destructive) { confirmDiscard = true }
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                 }
@@ -74,15 +100,22 @@ struct NoteView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if isDraft {
+            if unsaved {
                 HStack(spacing: 10) {
-                    SecondaryButton(title: "Edit template", systemImage: "slider.horizontal.3",
-                                    height: Theme.Spacing.barButton) { flush(); editingTemplate = true }
-                        .disabled(!canRewrite)
-                    PrimaryButton(title: "Save notes", systemImage: "checkmark",
-                                  height: Theme.Spacing.barButton) {
-                        flow.save(draft ?? note)
-                        draft = nil
+                    if flow.canRewrite(noteID) {
+                        SecondaryButton(title: "Edit template", systemImage: "slider.horizontal.3",
+                                        height: Theme.Spacing.barButton) { flush(); editingTemplate = true }
+                    } else {
+                        SecondaryButton(title: "Discard", systemImage: "trash",
+                                        height: Theme.Spacing.barButton) { confirmDiscard = true }
+                            .disabled(saving || flow.library.isSaving(noteID))
+                    }
+                    if isDraft {
+                        PrimaryButton(title: saving ? "Saving…" : "Save notes", systemImage: "checkmark",
+                                      height: Theme.Spacing.barButton) {
+                            Task { await save(note) }
+                        }
+                        .disabled(saving)
                     }
                 }
                 .padding(.horizontal, Theme.Spacing.screenSide)
@@ -92,28 +125,45 @@ struct NoteView: View {
                 .overlay(alignment: .top) { Rectangle().fill(Theme.border).frame(height: 1) }
             }
         }
+        // Typing happens in the keyboard's window, which touch tracking
+        // doesn't see: count edits as activity for auto-lock.
+        .onChange(of: draft) { flow.noteActivity() }
         .task(id: draft) {
             guard draft != nil else { return }
             try? await Task.sleep(for: .seconds(1))
             if !Task.isCancelled { flush() }
         }
-        // The library moved the note on (notes written, rewrite started):
-        // its version wins over local edits.
+        // The library moved the note on (notes written): its version wins
+        // over local edits.
         .onChange(of: note.state) { draft = nil }
         .onDisappear { flush() }
-        #if DEBUG
-        .task(id: note.state) {
-            if flow.debugTemplate, note.state == .draft { flow.debugTemplate = false; editingTemplate = true }
-        }
-        #endif
         .sheet(isPresented: $editingTemplate) {
             EditTemplateSheet(noteID: noteID, destination: note.writtenOn)
         }
+        .confirmationDialog("Discard these notes? The transcript is cleared from memory too.",
+                            isPresented: $confirmDiscard, titleVisibility: .visible) {
+            Button("Discard notes", role: .destructive) {
+                draft = nil
+                flow.discardSession()
+            }
+            Button("Keep notes", role: .cancel) {}
+        }
+    }
+
+    private func save(_ note: NoteItem) async {
+        saving = true
+        saveError = nil
+        let edited = draft ?? note
+        draft = nil
+        saveError = await flow.save(edited)
+        saving = false
     }
 
     private func flush() {
         guard let draft else { return }
-        if draft != flow.library.note(noteID) { flow.library.update(draft) }
+        if let current = flow.library.note(noteID), current.state == .draft, draft != current {
+            flow.library.update(draft)
+        }
         self.draft = nil
     }
 
@@ -123,6 +173,8 @@ struct NoteView: View {
                 if editable {
                     TextField("Title", text: note.title, axis: .vertical)
                         .accessibilityLabel("Title")
+                } else if note.wrappedValue.state == .writing && note.wrappedValue.title.isEmpty {
+                    Text("New session")
                 } else {
                     Text(note.wrappedValue.displayTitle)
                 }
@@ -135,10 +187,13 @@ struct NoteView: View {
                 .font(Theme.font(Theme.Size.control))
                 .foregroundStyle(Theme.mutedForeground)
             HStack(spacing: 6) {
-                if note.wrappedValue.writtenOn == .onDevice {
+                switch note.wrappedValue.writtenOn {
+                case .onDevice:
                     StatusTag(text: "Written on this iPhone", kind: .neutral, systemImage: "iphone")
-                } else {
+                case .privateCloud:
                     StatusTag(text: "Written in the private cloud", kind: .neutral, systemImage: "cloud")
+                case nil:
+                    EmptyView()
                 }
                 if editable { StatusTag(text: "Draft", kind: .draft, systemImage: "pencil") }
             }
@@ -148,46 +203,104 @@ struct NoteView: View {
     @ViewBuilder
     private func sections(_ note: Binding<NoteItem>, editable: Bool) -> some View {
         let body = Theme.font(Theme.Size.body)
-        if editable || !note.wrappedValue.summary.isEmpty {
+        if note.wrappedValue.sections.isEmpty {
+            Text("The notes came back empty.")
+                .font(body)
+                .foregroundStyle(Theme.mutedForeground)
+        }
+        ForEach(note.sections) { $section in
             VStack(alignment: .leading, spacing: 8) {
-                SectionLabel("Summary")
-                Group {
+                if !section.title.isEmpty { SectionLabel(section.title) }
+                if editable || !section.text.isEmpty {
                     if editable {
-                        TextField("Summary", text: note.summary, axis: .vertical)
+                        if !section.text.isEmpty || section.items.isEmpty {
+                            TextField(section.title.isEmpty ? "Notes" : section.title,
+                                      text: $section.text, axis: .vertical)
+                                .font(body)
+                                .lineSpacing(Theme.Size.body * 0.3)
+                                .foregroundStyle(Theme.foreground)
+                        }
                     } else {
-                        Text(note.wrappedValue.summary)
+                        Text(inlineMarkdown(section.text))
+                            .font(body)
+                            .lineSpacing(Theme.Size.body * 0.3)
+                            .foregroundStyle(Theme.foreground)
                     }
                 }
-                .font(body)
-                .lineSpacing(Theme.Size.body * 0.3)
-                .foregroundStyle(Theme.foreground)
-            }
-        }
-        if !note.wrappedValue.decisions.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                SectionLabel("Decisions")
-                ForEach(note.decisions.indices, id: \.self) { i in
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text("•").accessibilityHidden(true)
-                        if editable {
-                            TextField("Decision", text: note.decisions[i], axis: .vertical)
-                        } else {
-                            Text(note.wrappedValue.decisions[i])
+                if !section.items.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach($section.items) { $item in
+                            ItemRow(item: $item, editable: editable)
                         }
                     }
-                    .font(body)
+                }
+            }
+        }
+    }
+}
+
+/// Progress while notes are written. The step comes from the core
+/// ("Summary chunk 2 of 3", ...) when it reports one.
+private struct WritingBand: View {
+    let onDevice: Bool
+    let step: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProgressRing()
+                Text(onDevice ? "Writing notes on this iPhone…" : "Writing notes in the private cloud…")
+                    .font(Theme.font(Theme.Size.row, .bold))
+                    .foregroundStyle(Theme.info)
+            }
+            if let step, !step.isEmpty {
+                Text(step)
+                    .font(Theme.font(Theme.Size.secondary, .semibold))
                     .foregroundStyle(Theme.foreground)
-                }
+            }
+            Text(onDevice
+                 ? "This can take a few minutes for a long session. Keep Recordless open; the screen stays on."
+                 : "The transcript is sent only after the secure enclave's attestation verifies.")
+                .font(Theme.font(Theme.Size.secondary))
+                .foregroundStyle(Theme.mutedForeground)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.infoSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// A failed notes run. The core keeps the transcript, so it can be retried.
+private struct FailedBand: View {
+    let message: String
+    let canRetry: Bool
+    /// The other place notes can be written, when it's ready.
+    let alternative: NotesDestination?
+    /// nil retries where the notes were written before.
+    let retry: (NotesDestination?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Notes weren't written", systemImage: "exclamationmark.circle")
+                .font(Theme.font(Theme.Size.row, .bold))
+                .foregroundStyle(Theme.destructive)
+            Text(message)
+                .font(Theme.font(Theme.Size.secondary))
+                .foregroundStyle(Theme.foreground)
+                .fixedSize(horizontal: false, vertical: true)
+            if canRetry {
+                SecondaryButton(title: "Try again", systemImage: "arrow.clockwise") { retry(nil) }
+            }
+            if let alternative {
+                SecondaryButton(title: alternative == .onDevice ? "Write on this iPhone" : "Use private cloud",
+                                systemImage: alternative == .onDevice ? "iphone" : "lock.shield") { retry(alternative) }
             }
         }
-        if !note.wrappedValue.actions.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                SectionLabel("Action items").padding(.bottom, 4)
-                ForEach(note.actions) { $item in
-                    ActionRow(item: $item, editable: editable)
-                }
-            }
-        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardStyle(shadow: false)
     }
 }
 
@@ -221,45 +334,48 @@ private struct ReviewBand: View {
     }
 }
 
-private struct ActionRow: View {
-    @Binding var item: NoteItem.ActionItem
+private struct ItemRow: View {
+    @Binding var item: NoteSection.Item
     let editable: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button { item.done.toggle() } label: {
-                Image(systemName: item.done ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 20))
-                    .foregroundStyle(item.done ? Theme.primary : Theme.mutedForeground)
-                    .frame(width: Theme.Spacing.minTouch, height: Theme.Spacing.minTouch, alignment: .leading)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if let done = item.done {
+                Button { item.done = !done } label: {
+                    Image(systemName: done ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 20))
+                        .foregroundStyle(done ? Theme.primary : Theme.mutedForeground)
+                        .frame(width: Theme.Spacing.minTouch, height: Theme.Spacing.minTouch, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .disabled(!editable)
+                .accessibilityLabel(item.text)
+                .accessibilityValue(done ? "Done" : "Not done")
+                .accessibilityHint(editable ? "Double-tap to toggle." : "")
+            } else {
+                Text("•").accessibilityHidden(true)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(item.done ? "Mark not done" : "Mark done")
             Group {
                 if editable {
-                    TextField("Action item", text: $item.text, axis: .vertical)
+                    TextField("Item", text: $item.text, axis: .vertical)
                 } else {
-                    Text(item.text).strikethrough(item.done, color: Theme.mutedForeground)
+                    Text(inlineMarkdown(item.text))
+                        .strikethrough(item.done == true, color: Theme.mutedForeground)
                 }
             }
             .font(Theme.font(Theme.Size.body))
             .foregroundStyle(Theme.foreground)
         }
-        .frame(minHeight: Theme.Spacing.minTouch)
+        .frame(minHeight: item.done == nil ? nil : Theme.Spacing.minTouch)
     }
+}
+
+private func inlineMarkdown(_ s: String) -> AttributedString {
+    (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+        ?? AttributedString(s)
 }
 
 /// Plain-text export for Share and Copy. Generated notes only.
 enum NoteExport {
-    static func markdown(_ note: NoteItem) -> String {
-        var out = "# \(note.displayTitle)\n\n"
-        if !note.summary.isEmpty { out += "## Summary\n\n\(note.summary)\n\n" }
-        if !note.decisions.isEmpty {
-            out += "## Decisions\n\n" + note.decisions.map { "- \($0)" }.joined(separator: "\n") + "\n\n"
-        }
-        if !note.actions.isEmpty {
-            out += "## Action items\n\n" + note.actions.map { "- [\($0.done ? "x" : " ")] \($0.text)" }.joined(separator: "\n") + "\n"
-        }
-        return out
-    }
+    static func markdown(_ note: NoteItem) -> String { NoteMarkdown.render(note, forExport: true) }
 }
