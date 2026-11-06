@@ -21,6 +21,8 @@ final class Recorder {
     private(set) var stoppedAt: Date?
     private(set) var level: Float = 0
     private(set) var interrupted = false
+    /// When capture was cut off (call, Siri, failed restart), or nil.
+    private(set) var interruptedAt: Date?
     private(set) var progress: SessionProgress?
     private(set) var speechStats: SpeechStats?
     private(set) var modelLoadMs: UInt64?
@@ -97,15 +99,24 @@ final class Recorder {
             Task { @MainActor in
                 guard let self else { return }
                 switch state {
-                case .interrupted: self.interrupted = true
-                case .running: self.interrupted = false
+                case .interrupted: self.setInterrupted(true)
+                case .running:
+                    self.setInterrupted(false)
+                    if self.lastError?.hasPrefix("Microphone: ") == true { self.lastError = nil }
                 case .failed(let msg):
-                    self.interrupted = true
+                    self.setInterrupted(true)
                     self.lastError = "Microphone: \(msg)"
                 case .stopped: break
                 }
             }
         }
+    }
+
+    private func setInterrupted(_ value: Bool) {
+        guard phase == .recording || !value else { return }
+        if value, !interrupted { interruptedAt = Date() }
+        if !value { interruptedAt = nil }
+        interrupted = value
     }
 
     func start(speechModel: URL, useGpu: Bool) async {
@@ -165,6 +176,7 @@ final class Recorder {
                 }
             }
         } catch {
+            capture.stop()      // a half-started capture must not restart itself later
             lastError = "Could not start microphone: \(error.localizedDescription)"
             Task.detached { session.discard() }
             self.session = nil
@@ -236,6 +248,8 @@ final class Recorder {
         startedAt = nil
         stoppedAt = nil
         interrupted = false
+        interruptedAt = nil
+        lastError = nil         // no stale error on the next session's screen
         level = 0
         resetPause()
         phase = .idle

@@ -45,6 +45,7 @@ struct EditTemplateSheet: View {
                 SectionLabel("Template")
                 TextField("Template", text: $template, axis: .vertical)
                     .onChange(of: template) { flow.noteActivity() }
+                    .autocorrectionDisabled()
                     .lineLimit(4...8)
                     .font(Theme.font(Theme.Size.body))
                     .foregroundStyle(Theme.foreground)

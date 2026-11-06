@@ -35,6 +35,13 @@ final class AppFlow {
     /// transcript and the notebook locks, so a forgotten draft can't hold it
     /// open either.
     static let unsavedNotesCap: TimeInterval = 15 * 60
+    /// A session still listening with no new speech and no touches this
+    /// long is ended (transcript kept), so a forgotten session can't hold
+    /// the notebook open. The unsaved-notes cap then applies.
+    static let silentSessionCap: TimeInterval = 15 * 60
+    /// Speech-segment count at the last check, and when it last grew.
+    @ObservationIgnored private var lastSegmentCount = 0
+    @ObservationIgnored private var lastSpeechAt = Date()
     /// Shown on the Unlock screen after an automatic discard.
     private(set) var lockNotice: String?
     @ObservationIgnored private var lastActivity = Date()
@@ -206,13 +213,28 @@ final class AppFlow {
         }
     }
 
-    /// Discards a forgotten paused session or unsaved notes and locks.
+    /// Discards a forgotten paused or interrupted session, ends a forgotten
+    /// silent one, or discards unsaved notes, then locks.
     private func enforceCaps(now: Date = Date()) {
         guard !locked else { return }
-        if let since = session.pausedSince {
+        if let since = session.onHoldSince {
             if now.timeIntervalSince(max(since, lastActivity)) >= Self.pausedSessionCap {
+                let what = session.pausedSince != nil ? "paused" : "interrupted"
                 lock(force: true)
-                lockNotice = "The paused session was discarded after 15 minutes. Its transcript was cleared."
+                lockNotice = "The \(what) session was discarded after 15 minutes. Its transcript was cleared."
+            }
+            return
+        }
+        if session.status == .listening || session.status == .transcribing {
+            if session.segmentCount != lastSegmentCount {
+                lastSegmentCount = session.segmentCount
+                lastSpeechAt = now
+            }
+            if now.timeIntervalSince(max(lastSpeechAt, lastActivity)) >= Self.silentSessionCap {
+                // Restart the clock so the unsaved-notes cap gives the
+                // person another 15 minutes to write notes from it.
+                noteActivity()
+                Task { await endSession() }
             }
             return
         }
@@ -252,6 +274,8 @@ final class AppFlow {
         releaseTranscript()
         for note in library.notes where note.state == .draft || note.state == .failed { library.discard(note.id) }
         livePresented = true
+        lastSegmentCount = 0
+        lastSpeechAt = Date()
         let url = app.models.fileURL(spec)
         let gpu = UserDefaults.standard.bool(forKey: GPUSettings.speechKey)
         Task { await session.start(speechModel: url, useGpu: gpu) }
@@ -297,9 +321,9 @@ final class AppFlow {
         }
     }
 
-    func retry(_ id: UUID, scrub: Bool) {
+    func retry(_ id: UUID, on destination: NotesDestination? = nil, scrub: Bool) {
         guard transcriptNoteID == id else { return }
-        library.retry(id, scrub: scrub)
+        library.retry(id, on: destination, scrub: scrub)
     }
 
     /// Saves to the encrypted notebook, keeping only the notes and clearing

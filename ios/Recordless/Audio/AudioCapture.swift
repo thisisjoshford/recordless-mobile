@@ -90,7 +90,13 @@ final class AudioCapture: @unchecked Sendable {
             self._stats = CaptureStats()
         }
         registerObservers()
-        try startEngine()
+        do {
+            try startEngine()
+        } catch {
+            // Undo the half start so observers can't restart the mic later.
+            stop()
+            throw error
+        }
     }
 
     func stop() {

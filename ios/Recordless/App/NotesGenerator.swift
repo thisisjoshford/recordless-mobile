@@ -79,7 +79,7 @@ final class NotesGenerator {
 
     static let interruptedMessage =
         "Notes were interrupted because iOS stopped the app in the background. "
-        + "The transcript is kept: tap Write notes to retry."
+        + "The transcript is kept, so you can try again."
 
     init() {
         let d = UserDefaults.standard

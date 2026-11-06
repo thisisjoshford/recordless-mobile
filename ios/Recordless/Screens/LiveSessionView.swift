@@ -24,7 +24,8 @@ struct LiveSessionView: View {
                 Spacer(minLength: 0)
                 StatusPill(status: session.status)
             }
-            MicLevelCard(level: session.level, active: session.status == .listening || session.status == .transcribing)
+            MicLevelCard(level: session.status == .interrupted ? 0 : session.level,
+                         active: session.status == .listening || session.status == .transcribing)
             CapturedCard(segments: session.segments)
             if let problem = session.problem {
                 Text(problem)
@@ -48,7 +49,8 @@ struct LiveSessionView: View {
     @ViewBuilder
     private func controls(_ session: SessionStore) -> some View {
         let paused = session.status == .paused
-        let busy = session.status != .listening && session.status != .transcribing && !paused
+        let interrupted = session.status == .interrupted
+        let busy = session.status != .listening && session.status != .transcribing && !paused && !interrupted
         if session.status == .idle {
             // Didn't start (microphone off, model failed to load).
             PrimaryButton(title: "Close", systemImage: "xmark") { flow.discardSession() }
@@ -59,7 +61,7 @@ struct LiveSessionView: View {
                              size: Theme.Spacing.primaryButton, iconSize: 20) {
                 paused ? session.resume() : session.pause()
             }
-            .disabled(busy)
+            .disabled(busy || interrupted)
             PrimaryButton(title: "End session", systemImage: "stop.fill") {
                 Task { await flow.endSession() }
             }
@@ -97,6 +99,7 @@ struct StatusPill: View {
         case .listening: "Listening…"
         case .transcribing: "Transcribing…"
         case .paused: "Paused"
+        case .interrupted: "Interrupted"
         case .finishing: "Finishing…"
         case .ended: "Session ended"
         }
@@ -120,6 +123,8 @@ struct StatusPill: View {
             }
         case .paused:
             Image(systemName: "pause.fill").font(.system(size: 12, weight: .bold))
+        case .interrupted:
+            Image(systemName: "mic.slash").font(.system(size: 12, weight: .bold))
         case .starting, .finishing:
             ProgressView().controlSize(.small).tint(Theme.primary)
         case .ended:

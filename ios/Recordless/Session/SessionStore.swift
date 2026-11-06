@@ -19,7 +19,7 @@ struct CapturedSegment: Identifiable, Equatable {
 @Observable
 @MainActor
 final class SessionStore {
-    enum Status: Equatable { case idle, starting, listening, transcribing, paused, finishing, ended }
+    enum Status: Equatable { case idle, starting, listening, transcribing, paused, interrupted, finishing, ended }
 
     let recorder: Recorder
 
@@ -32,7 +32,9 @@ final class SessionStore {
         case .idle: .idle
         case .loadingModel: .starting
         case .recording:
-            recorder.paused ? .paused : recorder.progress?.transcribing == true ? .transcribing : .listening
+            recorder.paused ? .paused
+                : recorder.interrupted ? .interrupted
+                : recorder.progress?.transcribing == true ? .transcribing : .listening
         case .stopping: .finishing
         case .stopped: .ended
         }
@@ -43,10 +45,25 @@ final class SessionStore {
     var segments: [CapturedSegment] { (0..<segmentCount).map(CapturedSegment.init(id:)) }
 
     /// Why the session failed to start or stop, for the Live screen.
-    var problem: String? { recorder.stopFailure ?? (recorder.phase == .idle ? recorder.lastError : nil) }
+    var problem: String? {
+        if let failure = recorder.stopFailure { return failure }
+        if recorder.phase == .idle { return recorder.lastError }
+        if recorder.phase == .recording, recorder.interrupted, !recorder.paused {
+            return recorder.lastError
+                ?? "Listening stopped: another app or a call is using the microphone. It resumes when the microphone is free, or end the session now."
+        }
+        return nil
+    }
 
     /// When the current pause began, or nil if not paused.
     var pausedSince: Date? { recorder.pausedAt }
+
+    /// When the session stopped taking in audio without being ended: paused
+    /// by the person or cut off by the system. Nil while listening.
+    var onHoldSince: Date? {
+        guard recorder.phase == .recording else { return nil }
+        return recorder.pausedAt ?? recorder.interruptedAt
+    }
 
     var isActive: Bool { recorder.isCapturing }
     /// A stopped session whose transcript is still in memory.

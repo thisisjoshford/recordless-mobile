@@ -194,13 +194,20 @@ final class NotesLibrary {
     /// nothing is sent unless it passes.
     var cloudReadiness: CloudReadiness {
         guard vault.vault != nil else { return .unavailable("The private cloud needs the encrypted notebook.") }
-        guard let credit = generator.credit else {
-            if let e = generator.creditError { return .unavailable("Couldn't check private cloud credit: \(e)") }
-            return .checking
-        }
+        // A failed check wins over credit cached from an earlier one.
+        if let e = generator.creditError { return .unavailable("Couldn't check private cloud credit: \(e)") }
+        guard let credit = generator.credit else { return .checking }
         if !credit.active { return .unavailable("Not activated. Add an activation code in Settings, Developer tools, Notes.") }
         if credit.creditUsedUp { return .unavailable("Private cloud credit is used up.") }
         return .ready
+    }
+
+    /// Whether notes can be written on `destination` right now.
+    func isAvailable(_ destination: NotesDestination) -> Bool {
+        switch destination {
+        case .onDevice: onDeviceBlocker == nil
+        case .privateCloud: cloudReadiness == .ready
+        }
     }
 
     func refreshCloud() async {
@@ -218,10 +225,12 @@ final class NotesLibrary {
         return note.id
     }
 
-    /// Writes a failed note again (the core keeps the transcript on failure).
-    func retry(_ id: UUID, scrub: Bool) {
+    /// Writes a failed note again (the core keeps the transcript on
+    /// failure), where it was written before or on `destination`.
+    func retry(_ id: UUID, on destination: NotesDestination? = nil, scrub: Bool) {
         guard !isWriting, var note = note(id), note.state == .failed,
-              let destination = note.writtenOn else { return }
+              let destination = destination ?? note.writtenOn else { return }
+        note.writtenOn = destination
         note.state = .writing
         note.error = nil
         update(note)

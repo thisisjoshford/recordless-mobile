@@ -39,10 +39,14 @@ struct NoteView: View {
                 case .writing:
                     WritingBand(onDevice: note.writtenOn != .privateCloud, step: flow.library.writingStep)
                 case .failed:
+                    let canRetry = flow.session.hasTranscript && flow.library.sessionBlocker == nil
+                    let other: NotesDestination = note.writtenOn == .privateCloud ? .onDevice : .privateCloud
+                    // Retries scrub everything, the default; no confirmation needed.
                     FailedBand(message: note.error ?? "Notes couldn't be written.",
-                               canRetry: flow.session.hasTranscript && flow.library.sessionBlocker == nil) {
-                        flow.retry(noteID, scrub: true)
-                    }
+                               canRetry: canRetry,
+                               alternative: canRetry && flow.library.isAvailable(other) ? other : nil,
+                               retry: { flow.retry(noteID, on: $0, scrub: true) })
+                    .task { await flow.library.refreshCloud() }
                 case .draft, .saved:
                     if isDraft, let error = note.error {
                         Text(error)
@@ -64,6 +68,8 @@ struct NoteView: View {
             .padding(.bottom, 16)
         }
         .scrollDismissesKeyboard(.interactively)
+        // Notes text stays out of the keyboard's learned words.
+        .autocorrectionDisabled()
         .screenBackground()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
@@ -219,7 +225,6 @@ struct NoteView: View {
                             .font(body)
                             .lineSpacing(Theme.Size.body * 0.3)
                             .foregroundStyle(Theme.foreground)
-                            .textSelection(.enabled)
                     }
                 }
                 if !section.items.isEmpty {
@@ -271,7 +276,10 @@ private struct WritingBand: View {
 private struct FailedBand: View {
     let message: String
     let canRetry: Bool
-    let retry: () -> Void
+    /// The other place notes can be written, when it's ready.
+    let alternative: NotesDestination?
+    /// nil retries where the notes were written before.
+    let retry: (NotesDestination?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -283,7 +291,11 @@ private struct FailedBand: View {
                 .foregroundStyle(Theme.foreground)
                 .fixedSize(horizontal: false, vertical: true)
             if canRetry {
-                SecondaryButton(title: "Try again", systemImage: "arrow.clockwise", action: retry)
+                SecondaryButton(title: "Try again", systemImage: "arrow.clockwise") { retry(nil) }
+            }
+            if let alternative {
+                SecondaryButton(title: alternative == .onDevice ? "Write on this iPhone" : "Use private cloud",
+                                systemImage: alternative == .onDevice ? "iphone" : "lock.shield") { retry(alternative) }
             }
         }
         .padding(14)
@@ -349,7 +361,6 @@ private struct ItemRow: View {
                 } else {
                     Text(inlineMarkdown(item.text))
                         .strikethrough(item.done == true, color: Theme.mutedForeground)
-                        .textSelection(.enabled)
                 }
             }
             .font(Theme.font(Theme.Size.body))
